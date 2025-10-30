@@ -11,7 +11,9 @@ from orderbook_data_tools import (
     explode_levels,
     export_dataframe,
     iter_raw_events,
+    iter_snapshot_records,
     load_events_dataframe,
+    load_snapshot_dataframe,
 )
 
 
@@ -39,6 +41,31 @@ def _write_sample_file(tmp_path: Path) -> Path:
         },
     ]
     out_file = tmp_path / "sample.ndjson.gz"
+    with gzip.open(out_file, "wt", encoding="utf-8") as fh:
+        for evt in events:
+            fh.write(json.dumps(evt))
+            fh.write("\n")
+    return out_file
+
+
+def _write_sample_snapshot_file(tmp_path: Path) -> Path:
+    events = [
+        {
+            "ts_utc": "2024-01-01T00:00:00Z",
+            "symbol": "BTCUSDT",
+            "lastUpdateId": 200,
+            "bids": [["35000.0", "1.5"], ["34999.5", "0.2"]],
+            "asks": [["35001.0", "1.0"], ["35002.0", "0.7"]],
+        },
+        {
+            "ts_utc": "2024-01-01T00:00:05Z",
+            "symbol": "BTCUSDT",
+            "lastUpdateId": 210,
+            "bids": [["35000.5", "1.0"]],
+            "asks": [["35001.5", "2.0"]],
+        },
+    ]
+    out_file = tmp_path / "snapshot.ndjson.gz"
     with gzip.open(out_file, "wt", encoding="utf-8") as fh:
         for evt in events:
             fh.write(json.dumps(evt))
@@ -136,3 +163,25 @@ def test_export_dataframe(tmp_path: Path, fmt: str):
         expected_keys = sorted(top_df.columns)
         assert keys == expected_keys
 
+
+def test_iter_snapshot_records(tmp_path: Path):
+    path = _write_sample_snapshot_file(tmp_path)
+    records = list(iter_snapshot_records(path))
+    assert len(records) == 2
+    assert records[0]["symbol"] == "BTCUSDT"
+    assert records[0]["bids"][0] == (35000.0, 1.5)
+
+
+def test_load_snapshot_dataframe(tmp_path: Path):
+    path = _write_sample_snapshot_file(tmp_path)
+    df = load_snapshot_dataframe(path)
+    assert list(df.columns) == [
+        "ts_utc",
+        "symbol",
+        "last_update_id",
+        "bids",
+        "asks",
+        "ts_dt",
+    ]
+    assert len(df) == 2
+    assert pd.api.types.is_datetime64tz_dtype(df["ts_dt"])

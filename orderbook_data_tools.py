@@ -24,6 +24,67 @@ NormalizedEvent = Dict[str, object]
 PathLike = Union[str, Path]
 
 
+def iter_snapshot_records(
+    path: PathLike,
+    *,
+    limit: Optional[int] = None,
+    normalize: bool = True,
+) -> Iterator[NormalizedEvent]:
+    """
+    Stream order book snapshot entries saved by the recorder's snapshot mode.
+
+    Each record contains full bid/ask ladders fetched via REST along with `ts_utc`
+    and `lastUpdateId`.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    with gzip.open(path, mode="rt", encoding="utf-8") as fh:
+        for idx, line in enumerate(fh):
+            if limit is not None and idx >= limit:
+                break
+            raw: RawEvent = json.loads(line)
+            if normalize:
+                bids = _normalize_levels(raw.get("bids", []), is_bid=True)
+                asks = _normalize_levels(raw.get("asks", []), is_bid=False)
+                yield {
+                    "ts_utc": raw.get("ts_utc"),
+                    "symbol": raw.get("symbol"),
+                    "last_update_id": raw.get("lastUpdateId"),
+                    "bids": bids,
+                    "asks": asks,
+                }
+            else:
+                yield raw
+
+
+def load_snapshot_dataframe(
+    path: PathLike,
+    *,
+    limit: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Load snapshot records into a DataFrame for downstream analysis or plotting.
+
+    Adds a timezone-aware datetime column parsed from `ts_utc`.
+    """
+    records = list(iter_snapshot_records(path, limit=limit, normalize=True))
+    if not records:
+        return pd.DataFrame(columns=[
+            "ts_utc",
+            "symbol",
+            "last_update_id",
+            "bids",
+            "asks",
+            "ts_dt",
+        ])
+
+    df = pd.DataFrame(records)
+    df["ts_dt"] = pd.to_datetime(df["ts_utc"], utc=True)
+    return df
+
+
 def iter_raw_events(
     path: PathLike,
     *,
@@ -278,9 +339,10 @@ def _dataframe_columns() -> List[str]:
 
 __all__ = [
     "iter_raw_events",
+    "iter_snapshot_records",
     "load_events_dataframe",
+    "load_snapshot_dataframe",
     "compute_top_of_book",
     "explode_levels",
     "export_dataframe",
 ]
-

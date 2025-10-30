@@ -20,6 +20,9 @@ Usage examples:
   # Reconstruct in-memory book and write top 50 levels every second
   python binance_orderbook_recorder.py --symbol BTCUSDT --mode book --top-n 50 --snapshot-interval 1.0 --out ./data
 
+  # Poll REST snapshots (full depth) every 5 seconds
+  python binance_orderbook_recorder.py --symbol BTCUSDT --mode snapshot --snapshot-interval 5 --limit-snapshot 1000 --out ./data
+
 Requirements (see requirements.txt):
   websockets
   aiohttp
@@ -132,6 +135,7 @@ class Recorder:
         self.stop = asyncio.Event()
         self._raw_fp = None  # type: Optional[gzip.GzipFile]
         self._book_fp = None  # type: Optional[gzip.GzipFile]
+        self._snapshot_fp = None  # type: Optional[gzip.GzipFile]
         self.book = OrderBook()
         self.buffer = deque()  # buffer events until snapshot is loaded
         self.session: Optional[aiohttp.ClientSession] = None
@@ -167,6 +171,13 @@ class Recorder:
         self._book_fp.write(header_line.encode("utf-8"))
         self._book_fp.flush()
 
+    def _open_snapshot_file(self):
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        prefix = rotate_file_prefix(self.out_dir, self.symbol, f"depth_snapshot_{self.limit_snapshot}")
+        path = Path(str(prefix) + ".ndjson.gz")
+        logging.info(f"Writing order book snapshots to: {path}")
+        self._snapshot_fp = gzip.open(path, mode="ab")
+
     def _close_files(self):
         if self._raw_fp is not None:
             self._raw_fp.close()
@@ -174,6 +185,9 @@ class Recorder:
         if self._book_fp is not None:
             self._book_fp.close()
             self._book_fp = None
+        if self._snapshot_fp is not None:
+            self._snapshot_fp.close()
+            self._snapshot_fp = None
 
     # ----- Snapshot loading (REST) -----
 
@@ -247,6 +261,21 @@ class Recorder:
         }
         line = json.dumps(rec, separators=(",", ":")) + "\n"
         self._raw_fp.write(line.encode("utf-8"))
+
+    async def _write_snapshot_event(self, snapshot: dict):
+        if self._snapshot_fp is None:
+            self._open_snapshot_file()
+
+        record = {
+            "ts_utc": utc_now_iso(),
+            "symbol": self.symbol,
+            "lastUpdateId": snapshot.get("lastUpdateId"),
+            "bids": snapshot.get("bids", []),
+            "asks": snapshot.get("asks", []),
+        }
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        self._snapshot_fp.write(line.encode("utf-8"))
+        self._snapshot_fp.flush()
 
     async def _maybe_sync_and_apply(self):
         """Implements Binance snapshot+diff synchronization for book reconstruction.
@@ -348,6 +377,19 @@ class Recorder:
                 logging.warning(f"Snapshot task error: {e}")
                 await asyncio.sleep(self.snapshot_interval)
 
+    async def _periodic_snapshot_task(self):
+        """Fetch full depth snapshots via REST at a fixed interval and persist them."""
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+
+        while not self.stop.is_set():
+            try:
+                snapshot = await self._fetch_snapshot()
+                await self._write_snapshot_event(snapshot)
+            except Exception as e:
+                logging.warning(f"Snapshot polling error: {e}")
+            await asyncio.sleep(self.snapshot_interval)
+
     # ----- Orchestration -----
 
     async def run(self):
@@ -367,9 +409,14 @@ class Recorder:
         snapshot_task = None
         if self.mode == "book":
             snapshot_task = asyncio.create_task(self._book_snapshot_task())
+        elif self.mode == "snapshot":
+            ws_task.cancel()
+            snapshot_task = asyncio.create_task(self._periodic_snapshot_task())
+            ws_task = None
 
         await self.stop.wait()
-        ws_task.cancel()
+        if ws_task:
+            ws_task.cancel()
         if snapshot_task:
             snapshot_task.cancel()
         await asyncio.gather(*(t for t in [ws_task, snapshot_task] if t), return_exceptions=True)
@@ -384,7 +431,7 @@ class Recorder:
 def parse_args():
     p = argparse.ArgumentParser(description="Binance Spot Order Book Recorder")
     p.add_argument("--symbol", required=True, help="Trading pair symbol, e.g., BTCUSDT")
-    p.add_argument("--mode", choices=["raw", "book"], default="raw", help="Record raw deltas or reconstruct in-memory book + snapshots")
+    p.add_argument("--mode", choices=["raw", "book", "snapshot"], default="raw", help="raw: record deltas; book: in-memory reconstruction + top-N CSV; snapshot: periodic REST depth snapshots")
     p.add_argument("--top-n", type=int, default=50, help="Top N levels to write in book mode")
     p.add_argument("--snapshot-interval", type=float, default=1.0, help="Seconds between book snapshots (book mode)")
     p.add_argument("--limit-snapshot", type=int, default=1000, help="REST snapshot depth limit (max 5000; 1000 recommended)")
