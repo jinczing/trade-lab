@@ -1,13 +1,12 @@
+""""
+Module for parsing OKX Level 2 orderbook dumps and reconstructing snapshots from updates."""
+
 import os
-import time
 import json
-import hmac
-import hashlib
-import base64
-import requests
+
+from typing import List, Dict, Union, Any
+
 import pandas as pd
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Union, Any
 
 def parse_okx_orderbook_file(
     file_path: Union[str, os.PathLike],
