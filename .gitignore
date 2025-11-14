@@ -37,6 +37,7 @@ MANIFEST
 .DS_Store
 Thumbs.db
 
+# data
 /data/
 *.zip
 *.tar
@@ -44,3 +45,9 @@ Thumbs.db
 *.data
 *.pkl
 *.pickle
+
+# rust
+/target/
+**/target/
+Cargo.lock
+*.lock
