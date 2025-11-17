@@ -11,6 +11,7 @@ use ordered_float::OrderedFloat;
 use serde::Deserialize;
 
 const DAY_MILLIS: u64 = 86_400_000;
+const MIN_VOLUME: f64 = 1e-9;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -244,6 +245,10 @@ fn format_float(value: f64) -> String {
     } else {
         format!("{value:.8}")
     }
+}
+
+fn clamp_volume(value: f64) -> f64 {
+    if value.abs() < MIN_VOLUME { 0.0 } else { value }
 }
 
 struct OrderBook {
@@ -538,11 +543,11 @@ impl TradeEngine {
     }
 
     fn buy_volume(&self) -> f64 {
-        self.window.buy_volume
+        clamp_volume(self.window.buy_volume)
     }
 
     fn sell_volume(&self) -> f64 {
-        self.window.sell_volume
+        clamp_volume(self.window.sell_volume)
     }
 }
 
@@ -726,7 +731,7 @@ impl TradeWindow {
     }
 
     fn vwap(&self) -> f64 {
-        if self.vwap_den.abs() < f64::EPSILON {
+        if self.vwap_den.abs() < MIN_VOLUME {
             -1.0
         } else {
             self.vwap_num / self.vwap_den
