@@ -727,7 +727,7 @@ impl TradeWindow {
 
     fn vwap(&self) -> f64 {
         if self.vwap_den.abs() < f64::EPSILON {
-            0.0
+            -1.0
         } else {
             self.vwap_num / self.vwap_den
         }
