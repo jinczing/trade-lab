@@ -10,6 +10,8 @@ use humantime::parse_duration;
 use ordered_float::OrderedFloat;
 use serde::Deserialize;
 
+const DAY_MILLIS: u64 = 86_400_000;
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     run(cli)
@@ -26,11 +28,8 @@ fn run(cli: Cli) -> Result<()> {
         bail!("sampling frequency must be positive");
     }
 
-    let start_ts = date_to_timestamp(cli.start)?;
-    let end_ts = date_to_timestamp(cli.end + ChronoDuration::days(1))?;
-
     let sampling_days = dates_inclusive(cli.start, cli.end);
-    let trade_dates = build_trade_dates(&cli.trade_dir, cli.start, cli.end);
+    let trade_dates = build_trade_dates(cli.start, cli.end);
 
     let mut l2_stream = L2Stream::new(cli.l2_dir.clone(), sampling_days.clone())
         .context("unable to prepare order book stream")?;
@@ -39,29 +38,73 @@ fn run(cli: Cli) -> Result<()> {
     let mut order_book = OrderBook::new();
     let mut writer = FeatureWriter::new(cli.output.clone(), cli.depth)?;
 
-    let mut ts = start_ts;
-    while ts < end_ts {
-        l2_stream
-            .advance_to(ts, &mut order_book)
-            .with_context(|| format!("failed while applying L2 events up to {}", ts))?;
-        trade_engine
-            .advance_to(ts)
-            .with_context(|| format!("failed while aggregating trades up to {}", ts))?;
+    if cli.freq_ms > DAY_MILLIS {
+        bail!("sampling frequency must be shorter than one day");
+    }
 
-        let (asks, bids) = order_book.snapshot_sizes(cli.depth);
-        writer.write_row(
-            ts,
-            &asks,
-            &bids,
-            trade_engine.vwap(),
-            trade_engine.buy_volume(),
-            trade_engine.sell_volume(),
+    for day in sampling_days {
+        let day_start_ts = date_to_timestamp(day)?;
+        let day_end_ts = date_to_timestamp(day + ChronoDuration::days(1))?;
+
+        let mut ts = day_start_ts + cli.freq_ms;
+        if ts > day_end_ts {
+            bail!(
+                "sampling frequency {}ms produces no samples inside {}",
+                cli.freq_ms,
+                day
+            );
+        }
+
+        while ts < day_end_ts {
+            emit_features(
+                ts,
+                &mut l2_stream,
+                &mut trade_engine,
+                &mut order_book,
+                &mut writer,
+                cli.depth,
+            )?;
+            ts += cli.freq_ms;
+        }
+
+        emit_features(
+            day_end_ts,
+            &mut l2_stream,
+            &mut trade_engine,
+            &mut order_book,
+            &mut writer,
+            cli.depth,
         )?;
-
-        ts += cli.freq_ms;
     }
 
     writer.finish()?;
+    Ok(())
+}
+
+fn emit_features(
+    ts: u64,
+    l2_stream: &mut L2Stream,
+    trade_engine: &mut TradeEngine,
+    order_book: &mut OrderBook,
+    writer: &mut FeatureWriter,
+    depth: usize,
+) -> Result<()> {
+    l2_stream
+        .advance_to(ts, order_book)
+        .with_context(|| format!("failed while applying L2 events up to {}", ts))?;
+    trade_engine
+        .advance_to(ts)
+        .with_context(|| format!("failed while aggregating trades up to {}", ts))?;
+
+    let (asks, bids) = order_book.snapshot_sizes(depth);
+    writer.write_row(
+        ts,
+        &asks,
+        &bids,
+        trade_engine.vwap(),
+        trade_engine.buy_volume(),
+        trade_engine.sell_volume(),
+    )?;
     Ok(())
 }
 
@@ -122,15 +165,9 @@ fn dates_inclusive(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
     dates
 }
 
-fn build_trade_dates(trade_dir: &Path, start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
-    let mut dates = Vec::new();
-    if let Some(prev) = start.pred_opt() {
-        let prev_path = trade_dir.join(trade_file_name(prev));
-        if prev_path.exists() {
-            dates.push(prev);
-        }
-    }
-    dates.extend(dates_inclusive(start, end));
+fn build_trade_dates(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
+    let mut dates = dates_inclusive(start, end);
+    dates.push(end + ChronoDuration::days(1));
     dates
 }
 
