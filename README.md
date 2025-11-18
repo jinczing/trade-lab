@@ -1,87 +1,65 @@
-# Trade Lab OKX Orderbook Workflow
+# Trade Lab OKX Feature Workflow
 
-Utilities, Rust tooling, and notebooks to turn historical OKX Level 2 dumps into analysis-ready CSV files and fixed-interval snapshots.
+This repository focuses on transforming OKX BTC-USDT Level 2 book dumps and trade archives into aligned, fixed-interval feature datasets ready for research or downstream model training. The heavy lifting is handled by the Rust binary `okx-features`, while the accompanying notebook (`feature_lab.ipynb`) is used for inspection and lightweight analysis.
 
 ## Prerequisites
 
-- Rust toolchain (https://rustup.rs) for the `okx-orderbook-csv` binary.
-- Python environment with the notebook dependencies from `requirements.txt` (used in the notebooks listed below).
-- Downloaded `.data` archives from OKX Historical Data: https://www.okx.com/zh-hant/historical-data.
+- **Rust toolchain:** Install via [rustup.rs](https://rustup.rs). Once installed, run `rustup update` so `cargo run` is available in your shell.
+- **OKX historical data:** Download daily L2 archives (`BTC-USDT-L2orderbook-400lv-YYYY-MM-DD.tar.gz`) and trade archives (`BTC-USDT-trades-YYYY-MM-DD.zip`) from the OKX Historical Data portal. Place them under `btcusdt_l2/` and `btcusdt_trade/` respectively, one file per day (already the default layout in this repo).
+- **Python environment (optional):** Only required if you plan to open `feature_lab.ipynb`. Install the packages listed in `requirements.txt`.
 
-## 1. Download & Uncompress
+## Directory Expectations
 
-1. Request the Level 2 order-book dataset (e.g. `BTC-USDT-L2orderbook-400lv-2025-11-08.zip`) from the OKX portal.
-2. Unzip the archive so the raw NDJSON file is available locally: `BTC-USDT-L2orderbook-400lv-2025-11-08.data`.
-3. Place the `.data` file anywhere in your workspace (examples below assume `data/raw/`).
+```
+btcusdt_l2/
+    BTC-USDT-L2orderbook-400lv-2025-10-01.tar.gz
+    ...
+btcusdt_trade/
+    BTC-USDT-trades-2025-10-01.zip
+    ...
+rust/
+    okx-features/   # Rust crate with the CLI described below
+features/          # Suggested output directory (created automatically)
+```
 
-## 2. Convert `.data` to flat CSV (Rust)
+The order book archives contain NDJSON snapshots/updates, while the trade ZIP files contain CSV rows where each file spans 16:00 UTC (prev day) to 15:59:59 UTC (current day). The `okx-features` CLI understands this layout and stitches the correct windows automatically.
 
-The `rust/okx-orderbook-csv` crate includes a `convert` subcommand that mirrors `parse_okx_orderbook_file` but runs in Rust for speed.
+## Generating Features with `okx-features`
+
+Compile and run directly with Cargo:
 
 ```powershell
-cd rust/okx-orderbook-csv
-cargo run --release -- convert `
-  --input ..\..\data\raw\BTC-USDT-L2orderbook-400lv-2025-11-08.data `
-  --output ..\..\data\processed\btcusdt.csv
+cargo run -p okx-features -- \
+  --start 2025-10-01 --end 2025-10-03 `
+  --freq 1s --depth 20 `
+  --l2-dir btcusdt_l2 --trade-dir btcusdt_trade `
+  --format parquet --days-per-file 1 `
+  --output-dir features
 ```
 
-- Streams NDJSON rows, emits one CSV row per bid/ask level, preserves the raw millisecond `ts`, and adds an RFC3339 `timestamp` column.
-- Optional flags: `--nrows 100000` to stop early, `--no-timestamp` to skip the human-readable column.
+Key options:
 
-## 3. Rebuild fixed-interval snapshots (Rust)
+- `--start/--end` (UTC days) define the inclusive date range.
+- `--freq` controls the sampling interval (e.g., `1s`, `500ms`).
+- `--depth` sets how many book levels per side are exported.
+- `--format` chooses between `csv` and `parquet`. Both formats are written into the `--output-dir` directory.
+- `--days-per-file` groups multiple days into a single chunk. `1` means one file per day; `3` would produce rolling 3-day files.
+- The tool automatically handles trade warmups/carry-over to ensure VWAP/buy/sell volumes are continuous at day boundaries and emits the final snapshot at exactly `t+1 00:00:00`.
 
-Use the `rebuild` subcommand to replay the CSV and emit Level 2 snapshots at a consistent cadence (default 100 ms).
+Every output row contains:
 
-```powershell
-cd rust/okx-orderbook-csv
-cargo run --release -- rebuild `
-  --input ..\..\data\processed\btcusdt.csv `
-  --output ..\..\data\snapshots\btc.snapshots.csv `
-  --freq-ms 100 `
-  --depth 40 `
-  --max-duration-minutes 10
-```
+- `timestamp` (ms) and ISO8601 string
+- Rolling VWAP, buy volume, sell volume over the last sampling interval (VWAP is `-1` if no trades occurred in the window)
+- Bid/ask sizes for the requested depth (`ask_size_1 ... ask_size_n`, `bid_size_1 ... bid_size_n`)
 
-- Maintains an in-memory book per instrument while streaming the CSV.
-- Emits two rows per price level (`side=bid/ask`) with `action=snapshot` and the UTC timestamp.
-- `--depth` trims each side to the top *n* levels; `--max-duration-*` options limit how far past the first timestamp to simulate.
+CSV outputs create `features-YYYY-MM-DD-YYYY-MM-DD.csv` files inside the chosen directory. Parquet outputs follow the same naming convention but are Arrow-native `.parquet` files, so the directory can be treated as a partitioned dataset.
 
-## 4. Notebook workflows
+## Notebook
 
-- `snapshot-eda.ipynb` – ingests the fixed-interval snapshots and runs basic EDA: depth sanity checks, spread distributions, imbalance/liquidity heatmaps, and quick matplotlib/holoviews charts to validate the reconstructed books.
-- `hftbacktest-demo.ipynb` – showcases the `hftbacktest` bindings: converts OKX CSVs into `event_dtype`, wires up `BacktestAsset`/`HashMapMarketDepthBacktest`, and runs the demo strategies from `strategies.py` to highlight latency, queue, and maker/taker behavior.
+- **feature_lab.ipynb** – Explore, visualize, or post-process the generated feature files. Update the filepaths in the first cell if you saved the features somewhere other than `features/`.
 
-All notebooks assume processed CSVs live under `data/processed/` and snapshots under `data/snapshots/`; update the first cell if your paths differ.
+## Tips
 
-## Python helpers (`data_utils.py`)
-
-Use the pure-Python utilities when you need quick conversions without rebuilding the Rust binary:
-
-- `parse_okx_orderbook_file(path, as_dataframe=True, convert_timestamp=True, nrows=None)` streams the raw `.data` NDJSON into a pandas DataFrame (or list of dicts) with `instrument`, `action`, `side`, `price`, `size`, `count`, `ts`, and optional UTC timestamps.
-- `rebuild_snapshots_from_updates(df, depth=None)` replays parsed updates and emits Level 2 snapshots, optionally trimming to the top *n* levels per side to match the Rust `rebuild` output.
-- `rebuild_snapshots_every_100ms(df, freq_ms=100, depth=None)` produces synthetic fixed-cadence snapshots entirely in pandas—ideal for short EDA sessions before running the Rust binary on the full day.
-- `demo_convert_okx_csv_for_hftbacktest(csv_path, output_npz=None, limit=1000)` converts the flat CSV into the structured `HFT_EVENT_DTYPE` array expected by `hftbacktest`, optionally persisting it as a compressed `.npz` for lazy loading via `BacktestAsset().data([...])`.
-
-Example:
-
-```python
-from data_utils import (
-    parse_okx_orderbook_file,
-    rebuild_snapshots_from_updates,
-    demo_convert_okx_csv_for_hftbacktest,
-)
-
-updates = parse_okx_orderbook_file("data/raw/BTC-USDT.data", nrows=500_000)
-snapshots = rebuild_snapshots_from_updates(updates, depth=40)
-events = demo_convert_okx_csv_for_hftbacktest(
-    "data/processed/btcusdt.csv",
-    output_npz="btcusdt.npz",
-    limit=2_000_000,
-)
-```
-
-## Tips & Notes
-
-- Keep raw `.data` dumps compressed once converted; the CSV + snapshot files are sufficient for most downstream analyses.
-- When batching multiple instruments or days, script the two Rust commands (PowerShell, Makefile, etc.) before launching the notebooks.
-- For long sessions, prefer `cargo run --release` (or build once with `cargo build --release`) to keep processing times predictable.
+- Running with `cargo run --release` (or building once with `cargo build --release`) significantly speeds up multi-day processing.
+- If you only need CSV output, use `--format csv` and point `--output-dir` to a clean directory; the CLI will create it on demand.
+- Keep the raw archives compressed after extraction—the `okx-features` binary streams from the compressed `.tar.gz`/`.zip` files directly, so no intermediate unpacking is required.

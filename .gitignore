@@ -54,3 +54,6 @@ Thumbs.db
 **/target/
 Cargo.lock
 *.lock
+
+# other
+_lab.ipynb
