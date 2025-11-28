@@ -52,18 +52,24 @@ fn run(cli: Cli) -> Result<()> {
     let mut trade_engine = TradeEngine::new(cli.trade_dir.clone(), trade_dates, cli.freq_ms)
         .context("unable to prepare trade stream")?;
     let mut order_book = OrderBook::new();
-    let output = OutputManager::new(cli.output_dir.clone(), cli.format, cli.depth)?;
+    let output = OutputManager::new(
+        cli.output_dir.clone(),
+        cli.format,
+        cli.depth,
+        cli.include_price,
+    )?;
 
     for chunk in sampling_days.chunks(cli.days_per_file) {
         if chunk.is_empty() {
             continue;
         }
-        let mut buffer = ChunkBuffer::new(cli.depth);
+        let mut buffer = ChunkBuffer::new(cli.depth, cli.include_price);
         for &day in chunk {
             process_day(
                 day,
                 cli.freq_ms,
                 cli.depth,
+                cli.include_price,
                 &mut l2_stream,
                 &mut trade_engine,
                 &mut order_book,
@@ -82,6 +88,7 @@ fn process_day(
     day: NaiveDate,
     freq_ms: u64,
     depth: usize,
+    include_price: bool,
     l2_stream: &mut L2Stream,
     trade_engine: &mut TradeEngine,
     order_book: &mut OrderBook,
@@ -100,12 +107,26 @@ fn process_day(
     }
 
     while ts < day_end_ts {
-        let sample = collect_sample(ts, l2_stream, trade_engine, order_book, depth)?;
+        let sample = collect_sample(
+            ts,
+            l2_stream,
+            trade_engine,
+            order_book,
+            depth,
+            include_price,
+        )?;
         buffer.push(sample);
         ts += freq_ms;
     }
 
-    let sample = collect_sample(day_end_ts, l2_stream, trade_engine, order_book, depth)?;
+    let sample = collect_sample(
+        day_end_ts,
+        l2_stream,
+        trade_engine,
+        order_book,
+        depth,
+        include_price,
+    )?;
     buffer.push(sample);
     Ok(())
 }
@@ -116,6 +137,7 @@ fn collect_sample(
     trade_engine: &mut TradeEngine,
     order_book: &mut OrderBook,
     depth: usize,
+    include_price: bool,
 ) -> Result<FeatureSample> {
     l2_stream
         .advance_to(ts, order_book)
@@ -125,6 +147,12 @@ fn collect_sample(
         .with_context(|| format!("failed while aggregating trades up to {}", ts))?;
 
     let (asks, bids) = order_book.snapshot_sizes(depth);
+    let (ask_prices, bid_prices) = if include_price {
+        let (ask_prices, bid_prices) = order_book.snapshot_prices(depth);
+        (Some(ask_prices), Some(bid_prices))
+    } else {
+        (None, None)
+    };
     Ok(FeatureSample {
         ts,
         iso_time: format_timestamp(ts),
@@ -133,6 +161,8 @@ fn collect_sample(
         sell_volume: trade_engine.sell_volume(),
         asks,
         bids,
+        ask_prices,
+        bid_prices,
     })
 }
 
@@ -159,6 +189,12 @@ struct Cli {
         help = "Number of book levels to export per side"
     )]
     depth: usize,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Include price per level alongside size"
+    )]
+    include_price: bool,
     #[arg(long, default_value = "btcusdt_l2", value_name = "DIR")]
     l2_dir: PathBuf,
     #[arg(long, default_value = "btcusdt_trade", value_name = "DIR")]
@@ -227,6 +263,8 @@ struct FeatureSample {
     sell_volume: f64,
     asks: Vec<f64>,
     bids: Vec<f64>,
+    ask_prices: Option<Vec<f64>>,
+    bid_prices: Option<Vec<f64>>,
 }
 
 struct ChunkBuffer {
@@ -237,10 +275,12 @@ struct ChunkBuffer {
     sell_volume: Vec<f64>,
     ask_columns: Vec<Vec<f64>>,
     bid_columns: Vec<Vec<f64>>,
+    ask_price_columns: Option<Vec<Vec<f64>>>,
+    bid_price_columns: Option<Vec<Vec<f64>>>,
 }
 
 impl ChunkBuffer {
-    fn new(depth: usize) -> Self {
+    fn new(depth: usize, include_price: bool) -> Self {
         Self {
             timestamps: Vec::new(),
             iso_times: Vec::new(),
@@ -249,6 +289,10 @@ impl ChunkBuffer {
             sell_volume: Vec::new(),
             ask_columns: (0..depth).map(|_| Vec::new()).collect(),
             bid_columns: (0..depth).map(|_| Vec::new()).collect(),
+            ask_price_columns: include_price
+                .then(|| (0..depth).map(|_| Vec::new()).collect()),
+            bid_price_columns: include_price
+                .then(|| (0..depth).map(|_| Vec::new()).collect()),
         }
     }
 
@@ -261,7 +305,11 @@ impl ChunkBuffer {
             sell_volume,
             asks,
             bids,
+            ask_prices,
+            bid_prices,
         } = sample;
+        debug_assert_eq!(self.ask_price_columns.is_some(), ask_prices.is_some());
+        debug_assert_eq!(self.bid_price_columns.is_some(), bid_prices.is_some());
         self.timestamps.push(ts as i64);
         self.iso_times.push(iso_time);
         self.vwap.push(vwap);
@@ -274,6 +322,18 @@ impl ChunkBuffer {
         debug_assert_eq!(self.bid_columns.len(), bids.len());
         for (col, value) in self.bid_columns.iter_mut().zip(bids.into_iter()) {
             col.push(value);
+        }
+        if let (Some(price_cols), Some(prices)) = (self.ask_price_columns.as_mut(), ask_prices) {
+            debug_assert_eq!(price_cols.len(), prices.len());
+            for (col, value) in price_cols.iter_mut().zip(prices.into_iter()) {
+                col.push(value);
+            }
+        }
+        if let (Some(price_cols), Some(prices)) = (self.bid_price_columns.as_mut(), bid_prices) {
+            debug_assert_eq!(price_cols.len(), prices.len());
+            for (col, value) in price_cols.iter_mut().zip(prices.into_iter()) {
+                col.push(value);
+            }
         }
     }
 
@@ -290,9 +350,14 @@ struct OutputManager {
 }
 
 impl OutputManager {
-    fn new(base_dir: PathBuf, format: OutputFormat, depth: usize) -> Result<Self> {
-        let schema = build_schema(depth);
-        let header = build_header(depth);
+    fn new(
+        base_dir: PathBuf,
+        format: OutputFormat,
+        depth: usize,
+        include_price: bool,
+    ) -> Result<Self> {
+        let schema = build_schema(depth, include_price);
+        let header = build_header(depth, include_price);
         Ok(Self {
             base_dir,
             format,
@@ -331,6 +396,8 @@ impl OutputManager {
             sell_volume,
             ask_columns,
             bid_columns,
+            ask_price_columns,
+            bid_price_columns,
         } = buffer;
         let mut writer = csv::WriterBuilder::new()
             .has_headers(true)
@@ -348,8 +415,18 @@ impl OutputManager {
             for column in &ask_columns {
                 record.push(format_float(column[idx]));
             }
+            if let Some(columns) = &ask_price_columns {
+                for column in columns {
+                    record.push(format_float(column[idx]));
+                }
+            }
             for column in &bid_columns {
                 record.push(format_float(column[idx]));
+            }
+            if let Some(columns) = &bid_price_columns {
+                for column in columns {
+                    record.push(format_float(column[idx]));
+                }
             }
             writer.write_record(record)?;
         }
@@ -366,6 +443,8 @@ impl OutputManager {
             sell_volume,
             ask_columns,
             bid_columns,
+            ask_price_columns,
+            bid_price_columns,
         } = buffer;
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.header.len());
         arrays.push(Arc::new(Int64Array::from(timestamps)) as ArrayRef);
@@ -376,8 +455,18 @@ impl OutputManager {
         for column in ask_columns {
             arrays.push(Arc::new(Float64Array::from(column)) as ArrayRef);
         }
+        if let Some(columns) = ask_price_columns {
+            for column in columns {
+                arrays.push(Arc::new(Float64Array::from(column)) as ArrayRef);
+            }
+        }
         for column in bid_columns {
             arrays.push(Arc::new(Float64Array::from(column)) as ArrayRef);
+        }
+        if let Some(columns) = bid_price_columns {
+            for column in columns {
+                arrays.push(Arc::new(Float64Array::from(column)) as ArrayRef);
+            }
         }
         let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
         let props = WriterProperties::builder().build();
@@ -389,7 +478,7 @@ impl OutputManager {
     }
 }
 
-fn build_header(depth: usize) -> Vec<String> {
+fn build_header(depth: usize, include_price: bool) -> Vec<String> {
     let mut header = vec![
         "timestamp".to_string(),
         "iso_time".to_string(),
@@ -400,13 +489,23 @@ fn build_header(depth: usize) -> Vec<String> {
     for i in 0..depth {
         header.push(format!("ask_size_{}", i + 1));
     }
+    if include_price {
+        for i in 0..depth {
+            header.push(format!("ask_price_{}", i + 1));
+        }
+    }
     for i in 0..depth {
         header.push(format!("bid_size_{}", i + 1));
+    }
+    if include_price {
+        for i in 0..depth {
+            header.push(format!("bid_price_{}", i + 1));
+        }
     }
     header
 }
 
-fn build_schema(depth: usize) -> Arc<Schema> {
+fn build_schema(depth: usize, include_price: bool) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("timestamp", DataType::Int64, false),
         Field::new("iso_time", DataType::Utf8, false),
@@ -421,12 +520,30 @@ fn build_schema(depth: usize) -> Arc<Schema> {
             false,
         ));
     }
+    if include_price {
+        for i in 0..depth {
+            fields.push(Field::new(
+                format!("ask_price_{}", i + 1),
+                DataType::Float64,
+                false,
+            ));
+        }
+    }
     for i in 0..depth {
         fields.push(Field::new(
             format!("bid_size_{}", i + 1),
             DataType::Float64,
             false,
         ));
+    }
+    if include_price {
+        for i in 0..depth {
+            fields.push(Field::new(
+                format!("bid_price_{}", i + 1),
+                DataType::Float64,
+                false,
+            ));
+        }
     }
     Arc::new(Schema::new(fields))
 }
@@ -516,6 +633,24 @@ impl OrderBook {
         }
         for (_, size) in self.bids.iter().rev().take(depth) {
             bids.push(*size);
+        }
+        while bids.len() < depth {
+            bids.push(0.0);
+        }
+        (asks, bids)
+    }
+
+    fn snapshot_prices(&self, depth: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut asks = Vec::with_capacity(depth);
+        let mut bids = Vec::with_capacity(depth);
+        for (price, _) in self.asks.iter().take(depth) {
+            asks.push(price.0);
+        }
+        while asks.len() < depth {
+            asks.push(0.0);
+        }
+        for (price, _) in self.bids.iter().rev().take(depth) {
+            bids.push(price.0);
         }
         while bids.len() < depth {
             bids.push(0.0);
