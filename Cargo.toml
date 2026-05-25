@@ -3,4 +3,5 @@ members = [
     "rust/okx-features",
     "rust/okx-orderbook-csv",
     "rust/okx-backtest",
+    "rust/okx-highfrequency",
 ]
