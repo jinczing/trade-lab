@@ -1,0 +1,377 @@
+---
+title: "OKX HF EDA: Leverage Effect and Microstructure Noise (2601 + 2602)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1) Install and Load Packages
+
+```{r packages}
+required_pkgs <- c("data.table", "highfrequency", "xts", "zoo", "ggplot2")
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(data.table)
+library(highfrequency)
+library(xts)
+library(zoo)
+library(ggplot2)
+```
+
+## 2) Load and Concatenate Data
+
+```{r load-data}
+input_paths <- c(
+  "target/hf_2601_1m.csv",
+  "target/hf_2602_1m.csv"
+)
+
+missing_paths <- input_paths[!file.exists(input_paths)]
+if (length(missing_paths) > 0) {
+  stop("Missing input file(s): ", paste(missing_paths, collapse = ", "))
+}
+
+hf_list <- lapply(input_paths, fread)
+hf <- rbindlist(hf_list, use.names = TRUE, fill = TRUE, idcol = "source_id")
+hf[, source_file := input_paths[source_id]]
+
+required_cols <- c("DT", "PRICE", "BID", "OFR", "MIDQUOTE")
+if (!all(required_cols %in% names(hf))) {
+  stop(
+    "Input data must contain columns: ",
+    paste(required_cols, collapse = ", ")
+  )
+}
+
+numeric_cols <- c("PRICE", "BID", "OFR", "MIDQUOTE", "SIZE", "BIDSIZ", "OFRSIZ")
+available_numeric_cols <- intersect(numeric_cols, names(hf))
+
+hf[, DT := as.POSIXct(DT, tz = "UTC")]
+hf[, (available_numeric_cols) := lapply(.SD, as.numeric), .SDcols = available_numeric_cols]
+
+hf <- hf[
+  !is.na(DT) &
+    is.finite(PRICE) & PRICE > 0 &
+    is.finite(BID) & BID > 0 &
+    is.finite(OFR) & OFR > 0 &
+    OFR >= BID
+]
+
+setorder(hf, DT)
+hf[, DATE := as.Date(DT, tz = "UTC")]
+
+cat("Rows after cleaning:", nrow(hf), "\n")
+cat("Date range:", as.character(min(hf$DT)), "to", as.character(max(hf$DT)), "\n")
+cat("Number of UTC dates:", uniqueN(hf$DATE), "\n")
+cat("Input files:", paste(unique(hf$source_file), collapse = ", "), "\n")
+
+head(hf)
+```
+
+## 3) Quick Data Sanity Checks
+
+```{r sanity-checks}
+daily_counts <- hf[, .N, by = DATE][order(DATE)]
+daily_spread <- hf[, .(
+  mean_spread = mean(OFR - BID, na.rm = TRUE),
+  median_spread = median(OFR - BID, na.rm = TRUE),
+  mean_rel_spread_bps = mean((OFR - BID) / MIDQUOTE * 1e4, na.rm = TRUE)
+), by = DATE][order(DATE)]
+
+summary(daily_counts$N)
+summary(daily_spread$mean_rel_spread_bps)
+head(daily_counts)
+head(daily_spread)
+```
+
+## 4) Helper Functions
+
+```{r helper-functions}
+sample_freqs <- c(1L, 2L, 5L, 10L, 15L, 30L, 60L)
+
+resample_hf <- function(hf_data, freq_mins, tz = "UTC") {
+  dt <- copy(hf_data[, .(DT, PRICE, BID, OFR, MIDQUOTE)])
+  if (freq_mins > 1L) {
+    dt <- as.data.table(
+      aggregatePrice(
+        dt,
+        alignBy = "minutes",
+        alignPeriod = freq_mins,
+        marketOpen = "00:00:00",
+        marketClose = "23:59:59",
+        tz = tz
+      )
+    )
+  }
+
+  dt <- dt[
+    is.finite(PRICE) & PRICE > 0 &
+      is.finite(BID) & BID > 0 &
+      is.finite(OFR) & OFR > 0 &
+      is.finite(MIDQUOTE) & MIDQUOTE > 0 &
+      OFR >= BID
+  ]
+
+  dt[, DATE := as.Date(DT, tz = tz)]
+  valid_dates <- dt[, .N, by = DATE][N > 1L, DATE]
+  dt <- dt[DATE %in% valid_dates]
+  setorder(dt, DT)
+  dt
+}
+
+make_intraday_returns <- function(sampled_dt, price_col = "PRICE") {
+  out <- copy(sampled_dt)
+  out[, RET := log(get(price_col)) - shift(log(get(price_col))), by = DATE]
+  out[is.finite(RET)]
+}
+
+to_numeric_xts <- function(x) {
+  as.numeric(zoo::coredata(x))
+}
+
+daywise_noise_robust <- function(sampled_dt, estimator = c("rTSCov", "rRTSCov"), tz = "UTC") {
+  estimator <- match.arg(estimator)
+  px_xts <- xts(sampled_dt$PRICE, order.by = sampled_dt$DT, tzone = tz)
+  day_index <- as.Date(index(px_xts), tz = tz)
+  split_rows <- split(seq_along(day_index), day_index)
+
+  out <- rbindlist(lapply(names(split_rows), function(d) {
+    rows <- split_rows[[d]]
+    x_day <- px_xts[rows]
+    n_obs <- NROW(x_day)
+
+    if (n_obs < 20L) {
+      return(data.table(DATE = as.Date(d), value = NA_real_, n_obs = n_obs))
+    }
+
+    # rTS/rRTS in highfrequency requires at least ~10*K observations.
+    K_use <- max(2L, floor((n_obs - 1L) / 10L))
+    K_use <- min(K_use, 50L)
+    J_use <- 1L
+
+    est_val <- tryCatch(
+      {
+        if (estimator == "rTSCov") {
+          as.numeric(rTSCov(x_day, K = K_use, J = J_use))
+        } else {
+          as.numeric(rRTSCov(x_day, K = K_use, J = J_use))
+        }
+      },
+      error = function(e) NA_real_
+    )
+
+    data.table(DATE = as.Date(d), value = est_val, n_obs = n_obs)
+  }), fill = TRUE)
+
+  setorder(out, DATE)
+  out
+}
+```
+
+## 5) Leverage Effect Diagnostics by Sampling Frequency
+
+Leverage effect proxy used here: correlation between return at day `t` and volatility change from day `t` to `t+1`.
+
+```{r leverage-diagnostics}
+leverage_details <- lapply(sample_freqs, function(freq) {
+  sampled <- resample_hf(hf, freq_mins = freq, tz = "UTC")
+  rets <- make_intraday_returns(sampled, price_col = "PRICE")
+
+  daily_panel <- sampled[, .(close_price = last(PRICE)), by = DATE]
+  daily_rv <- rets[, .(rv = sum(RET^2, na.rm = TRUE)), by = DATE]
+  daily <- merge(daily_panel, daily_rv, by = "DATE", all = FALSE)
+  setorder(daily, DATE)
+
+  daily[, close_ret := log(close_price) - shift(log(close_price))]
+  daily[, rv_next := shift(rv, type = "lead")]
+  daily[, vol_change_t1 := rv_next - rv]
+
+  daily_model <- daily[
+    is.finite(close_ret) &
+      is.finite(vol_change_t1)
+  ]
+
+  if (nrow(daily_model) < 10L) {
+    return(list(
+      freq = freq,
+      summary = data.table(
+        sample_minutes = freq,
+        n_days = nrow(daily_model),
+        corr_ret_t_volchg_t1 = NA_real_,
+        beta_close_ret = NA_real_,
+        beta_pvalue = NA_real_,
+        mean_volchg_if_ret_neg = NA_real_,
+        mean_volchg_if_ret_pos = NA_real_,
+        neg_pos_volchg_ratio = NA_real_
+      ),
+      daily = daily
+    ))
+  }
+
+  fit <- lm(vol_change_t1 ~ close_ret, data = daily_model)
+  fit_coef <- summary(fit)$coefficients
+
+  mean_neg <- daily_model[close_ret < 0, mean(vol_change_t1, na.rm = TRUE)]
+  mean_pos <- daily_model[close_ret >= 0, mean(vol_change_t1, na.rm = TRUE)]
+
+  leverage_summary <- data.table(
+    sample_minutes = freq,
+    n_days = nrow(daily_model),
+    corr_ret_t_volchg_t1 = cor(daily_model$close_ret, daily_model$vol_change_t1),
+    beta_close_ret = unname(fit_coef["close_ret", "Estimate"]),
+    beta_pvalue = unname(fit_coef["close_ret", "Pr(>|t|)"]),
+    mean_volchg_if_ret_neg = mean_neg,
+    mean_volchg_if_ret_pos = mean_pos,
+    neg_pos_volchg_ratio = mean_neg / mean_pos
+  )
+
+  list(
+    freq = freq,
+    summary = leverage_summary,
+    daily = daily
+  )
+})
+
+leverage_summary <- rbindlist(lapply(leverage_details, `[[`, "summary"), fill = TRUE)
+leverage_summary
+```
+
+```{r leverage-plot}
+ggplot(leverage_summary, aes(x = sample_minutes, y = corr_ret_t_volchg_t1)) +
+  geom_line(color = "#2A6F97") +
+  geom_point(color = "#2A6F97", size = 2.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Leverage Effect by Sampling Frequency",
+    subtitle = "Correlation between close return (t) and volatility change (RV_t+1 - RV_t)",
+    x = "Sampling frequency (minutes)",
+    y = "Corr(ret_t, RV_t+1 - RV_t)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 6) Microstructure Noise Diagnostics by Sampling Frequency
+
+Diagnostics include:
+
+- lag-1 return autocorrelation (bid-ask bounce proxy)
+- volatility signature plot (mean daily RV vs frequency)
+- robust-vs-naive realized variance comparison (`rKernelCov`, `rTSCov`, `rRTSCov`)
+- average quoted spread and relative spread
+
+```{r microstructure-diagnostics}
+microstructure_details <- lapply(sample_freqs, function(freq) {
+  sampled <- resample_hf(hf, freq_mins = freq, tz = "UTC")
+  rets <- make_intraday_returns(sampled, price_col = "PRICE")
+  ret_vec <- rets$RET
+
+  lag1_acf <- if (length(ret_vec) > 1L) {
+    cor(ret_vec[-1], ret_vec[-length(ret_vec)])
+  } else {
+    NA_real_
+  }
+
+  ljung_p <- if (length(ret_vec) > 20L) {
+    Box.test(ret_vec, lag = 10L, type = "Ljung-Box")$p.value
+  } else {
+    NA_real_
+  }
+
+  spread_mean <- sampled[, mean(OFR - BID, na.rm = TRUE)]
+  spread_rel_bps <- sampled[, mean((OFR - BID) / MIDQUOTE * 1e4, na.rm = TRUE)]
+
+  px_xts <- xts(sampled$PRICE, order.by = sampled$DT, tzone = "UTC")
+  rv_xts <- rCov(px_xts, makeReturns = TRUE)
+  bp_xts <- rBPCov(px_xts, makeReturns = TRUE)
+  rk_xts <- suppressWarnings(rKernelCov(px_xts, makeReturns = TRUE))
+
+  rv_vec <- to_numeric_xts(rv_xts)
+  bp_vec <- to_numeric_xts(bp_xts)
+  rk_vec <- to_numeric_xts(rk_xts)
+  rk_vec[rk_vec < 0] <- NA_real_
+
+  ts_tbl <- daywise_noise_robust(sampled, estimator = "rTSCov", tz = "UTC")
+  rts_tbl <- daywise_noise_robust(sampled, estimator = "rRTSCov", tz = "UTC")
+
+  data.table(
+    sample_minutes = freq,
+    n_intraday_returns = length(ret_vec),
+    lag1_return_acf = lag1_acf,
+    ljung_box_pvalue_lag10 = ljung_p,
+    mean_spread = spread_mean,
+    mean_relative_spread_bps = spread_rel_bps,
+    mean_daily_rv = mean(rv_vec, na.rm = TRUE),
+    mean_daily_bp = mean(bp_vec, na.rm = TRUE),
+    mean_daily_rk = mean(rk_vec, na.rm = TRUE),
+    mean_daily_ts = mean(ts_tbl$value, na.rm = TRUE),
+    mean_daily_rts = mean(rts_tbl$value, na.rm = TRUE),
+    rv_minus_rk = mean(rv_vec - rk_vec, na.rm = TRUE),
+    rv_minus_rts = mean(rv_vec - rts_tbl$value, na.rm = TRUE)
+  )
+})
+
+microstructure_summary <- rbindlist(microstructure_details, fill = TRUE)
+microstructure_summary
+```
+
+```{r microstructure-plots}
+p_signature <- ggplot(microstructure_summary, aes(x = sample_minutes, y = mean_daily_rv)) +
+  geom_line(color = "#CC5500") +
+  geom_point(color = "#CC5500", size = 2.2) +
+  labs(
+    title = "Volatility Signature Plot",
+    subtitle = "Mean daily realized variance decreases as sampling gets coarser",
+    x = "Sampling frequency (minutes)",
+    y = "Mean daily RV"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_acf <- ggplot(microstructure_summary, aes(x = sample_minutes, y = lag1_return_acf)) +
+  geom_line(color = "#0B6E4F") +
+  geom_point(color = "#0B6E4F", size = 2.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Lag-1 Return Autocorrelation by Sampling Frequency",
+    x = "Sampling frequency (minutes)",
+    y = "Lag-1 autocorrelation"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_robust_gap <- ggplot(microstructure_summary, aes(x = sample_minutes, y = rv_minus_rk)) +
+  geom_line(color = "#1F4E79") +
+  geom_point(color = "#1F4E79", size = 2.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Naive RV - Realized Kernel (Noise Gap)",
+    x = "Sampling frequency (minutes)",
+    y = "Mean(RV - RK)"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_signature
+p_acf
+p_robust_gap
+```
+
+## 7) One-Page Summary Tables
+
+```{r summary-tables}
+cat("Leverage-effect summary across sampling frequencies:\n")
+leverage_summary
+
+cat("\nMicrostructure-noise summary across sampling frequencies:\n")
+microstructure_summary
+```
+
+## 8) Notes
+
+- If leverage effect is present, `corr_ret_t_volchg_t1` and `beta_close_ret` are typically negative.
+- If microstructure noise is present, very high-frequency returns often show stronger negative lag-1 autocorrelation and higher naive RV relative to noise-robust estimators.
+- You can extend `sample_freqs` to include seconds-level frequencies if higher-resolution data are added later.
