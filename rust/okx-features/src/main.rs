@@ -47,10 +47,19 @@ fn run(cli: Cli) -> Result<()> {
     let sampling_days = dates_inclusive(cli.start, cli.end);
     let trade_dates = build_trade_dates(cli.start, cli.end);
 
-    let mut l2_stream = L2Stream::new(cli.l2_dir.clone(), sampling_days.clone())
-        .context("unable to prepare order book stream")?;
-    let mut trade_engine = TradeEngine::new(cli.trade_dir.clone(), trade_dates, cli.freq_ms)
-        .context("unable to prepare trade stream")?;
+    let mut l2_stream = L2Stream::new(
+        cli.l2_dir.clone(),
+        sampling_days.clone(),
+        cli.symbol.clone(),
+    )
+    .context("unable to prepare order book stream")?;
+    let mut trade_engine = TradeEngine::new(
+        cli.trade_dir.clone(),
+        trade_dates,
+        cli.freq_ms,
+        cli.symbol.clone(),
+    )
+    .context("unable to prepare trade stream")?;
     let mut order_book = OrderBook::new();
     let output = OutputManager::new(
         cli.output_dir.clone(),
@@ -199,6 +208,8 @@ struct Cli {
     l2_dir: PathBuf,
     #[arg(long, default_value = "btcusdt_trade", value_name = "DIR")]
     trade_dir: PathBuf,
+    #[arg(long, default_value = "BTC-USDT", value_name = "SYMBOL")]
+    symbol: String,
     #[arg(long, default_value = "features", value_name = "DIR")]
     output_dir: PathBuf,
     #[arg(
@@ -289,10 +300,8 @@ impl ChunkBuffer {
             sell_volume: Vec::new(),
             ask_columns: (0..depth).map(|_| Vec::new()).collect(),
             bid_columns: (0..depth).map(|_| Vec::new()).collect(),
-            ask_price_columns: include_price
-                .then(|| (0..depth).map(|_| Vec::new()).collect()),
-            bid_price_columns: include_price
-                .then(|| (0..depth).map(|_| Vec::new()).collect()),
+            ask_price_columns: include_price.then(|| (0..depth).map(|_| Vec::new()).collect()),
+            bid_price_columns: include_price.then(|| (0..depth).map(|_| Vec::new()).collect()),
         }
     }
 
@@ -662,16 +671,18 @@ impl OrderBook {
 struct L2Stream {
     base_dir: PathBuf,
     dates: Vec<NaiveDate>,
+    symbol: String,
     day_idx: usize,
     current_day: Option<L2DayBuffer>,
     next_event: Option<L2Event>,
 }
 
 impl L2Stream {
-    fn new(base_dir: PathBuf, dates: Vec<NaiveDate>) -> Result<Self> {
+    fn new(base_dir: PathBuf, dates: Vec<NaiveDate>, symbol: String) -> Result<Self> {
         Ok(Self {
             base_dir,
             dates,
+            symbol,
             day_idx: 0,
             current_day: None,
             next_event: None,
@@ -715,7 +726,7 @@ impl L2Stream {
             }
             let date = self.dates[self.day_idx];
             self.day_idx += 1;
-            let buffer = L2DayBuffer::load(&self.base_dir, date)?;
+            let buffer = L2DayBuffer::load(&self.base_dir, &self.symbol, date)?;
             self.current_day = Some(buffer);
         }
     }
@@ -726,8 +737,8 @@ struct L2DayBuffer {
 }
 
 impl L2DayBuffer {
-    fn load(base_dir: &Path, date: NaiveDate) -> Result<Self> {
-        let file_name = l2_file_name(date);
+    fn load(base_dir: &Path, symbol: &str, date: NaiveDate) -> Result<Self> {
+        let file_name = l2_file_name(symbol, date);
         let path = base_dir.join(&file_name);
         let mut data = Vec::new();
         let file = File::open(&path)
@@ -858,9 +869,14 @@ struct TradeEngine {
 }
 
 impl TradeEngine {
-    fn new(base_dir: PathBuf, dates: Vec<NaiveDate>, window_ms: u64) -> Result<Self> {
+    fn new(
+        base_dir: PathBuf,
+        dates: Vec<NaiveDate>,
+        window_ms: u64,
+        symbol: String,
+    ) -> Result<Self> {
         Ok(Self {
-            stream: TradeStream::new(base_dir, dates),
+            stream: TradeStream::new(base_dir, dates, symbol),
             window: TradeWindow::new(window_ms),
         })
     }
@@ -889,16 +905,18 @@ impl TradeEngine {
 struct TradeStream {
     base_dir: PathBuf,
     dates: Vec<NaiveDate>,
+    symbol: String,
     day_idx: usize,
     current_iter: Option<csv::DeserializeRecordsIntoIter<Cursor<Vec<u8>>, TradeRecord>>,
     next_trade: Option<Trade>,
 }
 
 impl TradeStream {
-    fn new(base_dir: PathBuf, dates: Vec<NaiveDate>) -> Self {
+    fn new(base_dir: PathBuf, dates: Vec<NaiveDate>, symbol: String) -> Self {
         Self {
             base_dir,
             dates,
+            symbol,
             day_idx: 0,
             current_iter: None,
             next_trade: None,
@@ -936,16 +954,17 @@ impl TradeStream {
 
             let date = self.dates[self.day_idx];
             self.day_idx += 1;
-            self.current_iter = Some(load_trade_iter(&self.base_dir, date)?);
+            self.current_iter = Some(load_trade_iter(&self.base_dir, &self.symbol, date)?);
         }
     }
 }
 
 fn load_trade_iter(
     base_dir: &Path,
+    symbol: &str,
     date: NaiveDate,
 ) -> Result<csv::DeserializeRecordsIntoIter<Cursor<Vec<u8>>, TradeRecord>> {
-    let file_name = trade_file_name(date);
+    let file_name = trade_file_name(symbol, date);
     let path = base_dir.join(&file_name);
     let file = File::open(&path)
         .with_context(|| format!("unable to open trade file {}", path.display()))?;
@@ -1074,13 +1093,14 @@ impl TradeWindow {
     }
 }
 
-fn l2_file_name(date: NaiveDate) -> String {
+fn l2_file_name(symbol: &str, date: NaiveDate) -> String {
     format!(
-        "BTC-USDT-L2orderbook-400lv-{}.tar.gz",
+        "{}-L2orderbook-400lv-{}.tar.gz",
+        symbol,
         date.format("%Y-%m-%d")
     )
 }
 
-fn trade_file_name(date: NaiveDate) -> String {
-    format!("BTC-USDT-trades-{}.zip", date.format("%Y-%m-%d"))
+fn trade_file_name(symbol: &str, date: NaiveDate) -> String {
+    format!("{}-trades-{}.zip", symbol, date.format("%Y-%m-%d"))
 }
