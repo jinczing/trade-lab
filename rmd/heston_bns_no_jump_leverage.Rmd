@@ -1,0 +1,498 @@
+---
+title: "Heston No-Jump Simulation: Daily BNS Jump Test with and without Leverage"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1) Packages
+
+```{r packages}
+required_pkgs <- c("highfrequency", "data.table", "xts", "zoo")
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_pkgs) > 0L) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_pkgs, collapse = ", "),
+    ". Install them before rendering this Rmd."
+  )
+}
+
+library(highfrequency)
+library(data.table)
+library(xts)
+library(zoo)
+```
+
+# 2) Model and Experiment Design
+
+We simulate the no-jump Heston-type stochastic volatility model:
+
+$$dX_t = \sqrt{V_t}\,dW_t,\qquad
+dV_t = \kappa(\theta - V_t)\,dt + \xi\sqrt{V_t}\,dB_t,$$
+
+with instantaneous correlation
+$$\mathrm{corr}(dW_t, dB_t) = \rho.$$
+
+- `rho = 0`: no leverage effect.
+- `rho < 0`: leverage effect.
+
+There is **no jump component** in the data generating process, so the BNS jump test should reject near the nominal significance level if well-sized.
+
+# 3) Simulation/Test Parameters
+
+```{r parameters}
+set.seed(20260602)
+
+# Monte Carlo design (override via options() for quick smoke tests)
+n_paths <- as.integer(getOption("heston_bns_n_paths", 200L))
+n_days <- as.integer(getOption("heston_bns_n_days", 252L))
+steps_per_day <- as.integer(getOption("heston_bns_steps_per_day", 288L))  # 5-minute over 24h
+confidence_grid <- getOption("heston_bns_confidence_grid", c(0.90, 0.95, 0.99))
+
+# Heston parameters
+heston_par <- list(
+  kappa = 5.0,
+  theta = 0.04,
+  xi = 0.60,
+  v0 = 0.04
+)
+
+# Leverage scenarios
+scenario_tbl <- data.table(
+  scenario = c("No leverage", "Leverage"),
+  rho = c(0.0, -0.7)
+)
+
+# Additional analysis A: leverage level grid
+leverage_rho_grid <- as.numeric(getOption(
+  "heston_bns_leverage_rho_grid",
+  c(0.0, -0.2, -0.4, -0.6, -0.8, -0.95)
+))
+leverage_rho_grid <- sort(unique(leverage_rho_grid), decreasing = TRUE)
+n_paths_leverage_grid <- as.integer(getOption("heston_bns_n_paths_leverage_grid", 120L))
+n_days_leverage_grid <- as.integer(getOption("heston_bns_n_days_leverage_grid", n_days))
+
+# Additional analysis B: sampling interval grid at fixed leverage
+sampling_fixed_rho <- as.numeric(getOption("heston_bns_sampling_fixed_rho", -0.7))
+sampling_minutes_grid <- sort(unique(as.integer(getOption(
+  "heston_bns_sampling_minutes_grid",
+  c(1L, 2L, 5L, 10L, 15L, 30L, 60L)
+))))
+sampling_base_steps_per_day <- as.integer(getOption("heston_bns_sampling_base_steps_per_day", 1440L))
+n_paths_sampling_grid <- as.integer(getOption("heston_bns_n_paths_sampling_grid", 80L))
+n_days_sampling_grid <- as.integer(getOption("heston_bns_n_days_sampling_grid", n_days))
+
+if (any(!is.finite(sampling_minutes_grid)) || any(sampling_minutes_grid < 1L)) {
+  stop("sampling_minutes_grid must be positive integers.")
+}
+
+scenario_tbl
+```
+
+# 4) Heston No-Jump Simulator (Full-Truncation Euler)
+
+```{r simulator}
+simulate_heston_no_jump <- function(
+  n_days,
+  steps_per_day,
+  kappa,
+  theta,
+  xi,
+  v0,
+  rho,
+  start_time = as.POSIXct("2025-01-01 00:00:00", tz = "UTC")
+) {
+  n_steps <- n_days * steps_per_day
+  dt <- 1 / (252 * steps_per_day)
+  if ((24L * 60L * 60L) %% steps_per_day != 0L) {
+    stop("steps_per_day must divide 86400 exactly.")
+  }
+  step_seconds <- as.integer(24 * 60 * 60 / steps_per_day)
+
+  z_w <- rnorm(n_steps)
+  z_i <- rnorm(n_steps)
+  z_b <- rho * z_w + sqrt(1 - rho^2) * z_i
+
+  x <- numeric(n_steps + 1L)
+  v <- numeric(n_steps + 1L)
+  v[1] <- v0
+
+  for (i in seq_len(n_steps)) {
+    v_pos <- max(v[i], 0)
+    dW <- sqrt(dt) * z_w[i]
+    dB <- sqrt(dt) * z_b[i]
+
+    x[i + 1L] <- x[i] + sqrt(v_pos) * dW
+    v_next <- v[i] + kappa * (theta - v_pos) * dt + xi * sqrt(v_pos) * dB
+    v[i + 1L] <- max(v_next, 0)
+  }
+
+  dt_index <- start_time + seq.int(0L, n_steps) * step_seconds
+  out <- data.table(
+    DT = as.POSIXct(dt_index, origin = "1970-01-01", tz = "UTC"),
+    PRICE = exp(x),
+    V = v
+  )
+
+  out[, DATE := as.Date(DT, tz = "UTC")]
+  out <- out[, .(DT, PRICE, V, DATE)]
+  out
+}
+```
+
+# 5) BNS Helpers
+
+```{r bns-helpers}
+extract_daily_bns_summary <- function(obj, confidence_level, tz = "UTC") {
+  sig_level <- 1 - confidence_level
+
+  if (is.list(obj) && !xts::is.xts(obj) && length(obj) > 0L && is.list(obj[[1]])) {
+    out <- rbindlist(lapply(seq_along(obj), function(i) {
+      x <- obj[[i]]
+      crit <- as.numeric(x$critical.value)
+      dname <- if (!is.null(names(obj))) names(obj)[i] else NA_character_
+      data.table(
+        DATE = suppressWarnings(as.Date(dname)),
+        ztest = as.numeric(x$ztest)[1],
+        critical_lower = if (length(crit) >= 1L) crit[1] else NA_real_,
+        critical_upper = if (length(crit) >= 2L) crit[2] else NA_real_,
+        pvalue = as.numeric(x$pvalue)[1]
+      )
+    }), fill = TRUE)
+  } else if (xts::is.xts(obj)) {
+    raw_tbl <- data.table(
+      DATE = as.Date(zoo::index(obj), tz = tz),
+      as.data.frame(zoo::coredata(obj), check.names = FALSE)
+    )
+    p_col <- grep("^p.?value$|p-value|pvalue", names(raw_tbl), ignore.case = TRUE, value = TRUE)[1]
+    z_col <- grep("^z.?test$|^ztest$", names(raw_tbl), ignore.case = TRUE, value = TRUE)[1]
+    lo_col <- grep("^lower$|critical.*lower", names(raw_tbl), ignore.case = TRUE, value = TRUE)[1]
+    up_col <- grep("^upper$|critical.*upper", names(raw_tbl), ignore.case = TRUE, value = TRUE)[1]
+
+    out <- raw_tbl[, .(
+      DATE,
+      ztest = as.numeric(get(z_col)),
+      critical_lower = as.numeric(get(lo_col)),
+      critical_upper = as.numeric(get(up_col)),
+      pvalue = as.numeric(get(p_col))
+    )]
+  } else {
+    stop("Unsupported BNSjumpTest output class: ", paste(class(obj), collapse = ", "))
+  }
+
+  out <- out[!is.na(DATE)]
+  out[, `:=`(
+    confidence_level = confidence_level,
+    nominal_alpha = 1 - confidence_level,
+    reject_null = !is.na(pvalue) & (pvalue < (1 - confidence_level))
+  )]
+  setorder(out, DATE)
+  out
+}
+
+run_daily_bns_grid <- function(price_dt, confidence_grid) {
+  valid_dt <- copy(price_dt)
+  valid_dt[, DATE := as.Date(DT, tz = "UTC")]
+  valid_dates <- valid_dt[, .N, by = DATE][N > 1L, DATE]
+  valid_dt <- valid_dt[DATE %in% valid_dates, .(DT, PRICE)]
+
+  rbindlist(lapply(confidence_grid, function(conf_lvl) {
+    alpha_q <- 1 - (1 - conf_lvl) / 2
+    bns_obj <- BNSjumpTest(
+      rData = valid_dt,
+      type = "ratio",
+      max = TRUE,
+      makeReturns = TRUE,
+      alpha = alpha_q
+    )
+    out <- extract_daily_bns_summary(bns_obj, confidence_level = conf_lvl, tz = "UTC")
+    out[, alpha_quantile := alpha_q]
+    out
+  }), fill = TRUE)
+}
+
+resample_to_minutes <- function(price_dt, sample_minutes, tz = "UTC") {
+  if (sample_minutes <= 1L) {
+    out <- copy(price_dt)
+    setorder(out, DT)
+    return(out[, .(DT, PRICE)])
+  }
+
+  out <- aggregatePrice(
+    pData = copy(price_dt),
+    alignBy = "minutes",
+    alignPeriod = sample_minutes,
+    marketOpen = "00:00:00",
+    marketClose = "23:59:59",
+    tz = tz
+  )
+  out <- as.data.table(out)[, .(DT, PRICE)]
+  out <- out[is.finite(PRICE) & !is.na(DT)]
+  setorder(out, DT)
+  out
+}
+
+calc_binom_ci <- function(x, n, conf.level = 0.95) {
+  ci <- stats::binom.test(x = x, n = n, conf.level = conf.level)$conf.int
+  c(lower = ci[1], upper = ci[2])
+}
+
+summarize_rejection_rates <- function(result_dt, group_cols) {
+  out <- result_dt[, .(
+    n_tests = .N,
+    reject_count = sum(reject_null, na.rm = TRUE),
+    rejection_rate = mean(reject_null, na.rm = TRUE),
+    mean_pvalue = mean(pvalue, na.rm = TRUE)
+  ), by = group_cols]
+
+  ci_mat <- t(mapply(calc_binom_ci, out$reject_count, out$n_tests))
+  out[, ci_lower := as.numeric(ci_mat[, 1L])]
+  out[, ci_upper := as.numeric(ci_mat[, 2L])]
+  out[, over_reject_point := rejection_rate > nominal_alpha]
+  out[, over_reject_ci := ci_lower > nominal_alpha]
+  out[, size_ratio := rejection_rate / nominal_alpha]
+  out
+}
+```
+
+# 6) Monte Carlo Experiment
+
+```{r run-mc}
+run_one_path <- function(path_id, scenario_name, rho, n_days, steps_per_day, par_list, conf_grid) {
+  sim <- simulate_heston_no_jump(
+    n_days = n_days,
+    steps_per_day = steps_per_day,
+    kappa = par_list$kappa,
+    theta = par_list$theta,
+    xi = par_list$xi,
+    v0 = par_list$v0,
+    rho = rho
+  )
+
+  bns_daily <- run_daily_bns_grid(sim[, .(DT, PRICE)], confidence_grid = conf_grid)
+  bns_daily[, `:=`(
+    scenario = scenario_name,
+    rho = rho,
+    path_id = path_id
+  )]
+  bns_daily
+}
+
+all_results <- rbindlist(lapply(seq_len(n_paths), function(pid) {
+  rbindlist(lapply(seq_len(nrow(scenario_tbl)), function(j) {
+    run_one_path(
+      path_id = pid,
+      scenario_name = scenario_tbl$scenario[j],
+      rho = scenario_tbl$rho[j],
+      n_days = n_days,
+      steps_per_day = steps_per_day,
+      par_list = heston_par,
+      conf_grid = confidence_grid
+    )
+  }), fill = TRUE)
+}), fill = TRUE)
+
+cat("Total daily tests:", nrow(all_results), "\n")
+head(all_results)
+```
+
+# 7) Rejection Rates vs Nominal Size
+
+```{r rejection-summary}
+summary_tbl <- summarize_rejection_rates(
+  all_results,
+  group_cols = c("scenario", "rho", "confidence_level", "nominal_alpha")
+)
+
+setorder(summary_tbl, confidence_level, scenario)
+summary_tbl[]
+```
+
+# 8) Leverage vs No-Leverage Comparison
+
+```{r comparison}
+comp <- merge(
+  summary_tbl[scenario == "No leverage", .(
+    confidence_level,
+    nominal_alpha,
+    rejection_rate_no_lev = rejection_rate,
+    ci_lower_no_lev = ci_lower,
+    ci_upper_no_lev = ci_upper
+  )],
+  summary_tbl[scenario == "Leverage", .(
+    confidence_level,
+    nominal_alpha,
+    rejection_rate_lev = rejection_rate,
+    ci_lower_lev = ci_lower,
+    ci_upper_lev = ci_upper
+  )],
+  by = c("confidence_level", "nominal_alpha"),
+  all = TRUE
+)
+
+comp[, `:=`(
+  diff_lev_minus_no_lev = rejection_rate_lev - rejection_rate_no_lev,
+  lev_size_ratio = rejection_rate_lev / nominal_alpha,
+  no_lev_size_ratio = rejection_rate_no_lev / nominal_alpha
+)]
+
+setorder(comp, confidence_level)
+comp[]
+```
+
+# 9) Conclusion under the No-Jump Null
+
+```{r conclusion}
+conclusion_tbl <- comp[, .(
+  confidence_level,
+  nominal_alpha,
+  rejection_rate_no_lev,
+  rejection_rate_lev,
+  diff_lev_minus_no_lev
+)]
+
+print(conclusion_tbl)
+
+if (all(comp$diff_lev_minus_no_lev > 0, na.rm = TRUE)) {
+  cat(
+    "\nConclusion: in this simulation, leverage (negative rho) consistently increases",
+    "false jump rejections versus rho = 0 under the no-jump null.\n"
+  )
+} else {
+  cat(
+    "\nConclusion: leverage does not uniformly increase false rejections",
+    "for all confidence levels in this run.\n"
+  )
+}
+
+if (any(summary_tbl$scenario == "Leverage" & summary_tbl$over_reject_point, na.rm = TRUE)) {
+  cat(
+    "At least one leverage configuration shows point-estimate over-rejection",
+    "(empirical size above nominal alpha).\n"
+  )
+}
+```
+
+# 10) Effect of Leverage Level (How Negative rho Is)
+
+```{r leverage-level-run}
+leverage_level_results <- rbindlist(lapply(seq_len(n_paths_leverage_grid), function(pid) {
+  rbindlist(lapply(leverage_rho_grid, function(rho_i) {
+    out <- run_one_path(
+      path_id = pid,
+      scenario_name = sprintf("rho=%.2f", rho_i),
+      rho = rho_i,
+      n_days = n_days_leverage_grid,
+      steps_per_day = steps_per_day,
+      par_list = heston_par,
+      conf_grid = confidence_grid
+    )
+    out[, rho_level := rho_i]
+    out
+  }), fill = TRUE)
+}), fill = TRUE)
+
+cat("Leverage-level daily tests:", nrow(leverage_level_results), "\n")
+```
+
+```{r leverage-level-summary}
+leverage_level_summary <- summarize_rejection_rates(
+  leverage_level_results,
+  group_cols = c("rho_level", "confidence_level", "nominal_alpha")
+)
+
+setorder(leverage_level_summary, confidence_level, -rho_level)
+leverage_level_summary[]
+```
+
+```{r leverage-level-trend}
+leverage_trend <- leverage_level_summary[, {
+  ord <- order(abs(rho_level))
+  rr_ord <- rejection_rate[ord]
+  rho_ord <- abs(rho_level[ord])
+  data.table(
+    corr_abs_rho_vs_rejection = suppressWarnings(cor(rho_ord, rr_ord)),
+    slope_abs_rho = as.numeric(coef(lm(rr_ord ~ rho_ord))[2]),
+    monotone_non_decreasing = all(diff(rr_ord) >= -1e-12)
+  )
+}, by = .(confidence_level, nominal_alpha)]
+
+setorder(leverage_trend, confidence_level)
+leverage_trend[]
+```
+
+# 11) Effect of Sampling Interval (Fixed Leverage)
+
+```{r sampling-grid-run}
+sampling_grid_results <- rbindlist(lapply(seq_len(n_paths_sampling_grid), function(pid) {
+  sim_path <- simulate_heston_no_jump(
+    n_days = n_days_sampling_grid,
+    steps_per_day = sampling_base_steps_per_day,
+    kappa = heston_par$kappa,
+    theta = heston_par$theta,
+    xi = heston_par$xi,
+    v0 = heston_par$v0,
+    rho = sampling_fixed_rho
+  )
+
+  rbindlist(lapply(sampling_minutes_grid, function(m) {
+    sampled <- resample_to_minutes(sim_path[, .(DT, PRICE)], sample_minutes = m, tz = "UTC")
+    out <- run_daily_bns_grid(sampled, confidence_grid = confidence_grid)
+    out[, `:=`(
+      path_id = pid,
+      rho = sampling_fixed_rho,
+      sample_minutes = m
+    )]
+    out
+  }), fill = TRUE)
+}), fill = TRUE)
+
+cat("Sampling-grid daily tests:", nrow(sampling_grid_results), "\n")
+```
+
+```{r sampling-grid-summary}
+sampling_grid_summary <- summarize_rejection_rates(
+  sampling_grid_results,
+  group_cols = c("sample_minutes", "rho", "confidence_level", "nominal_alpha")
+)
+
+setorder(sampling_grid_summary, confidence_level, sample_minutes)
+sampling_grid_summary[]
+```
+
+```{r sampling-grid-trend}
+sampling_trend <- sampling_grid_summary[, {
+  ord <- order(sample_minutes)
+  rr_ord <- rejection_rate[ord]
+  m_ord <- sample_minutes[ord]
+  data.table(
+    corr_minutes_vs_rejection = suppressWarnings(cor(m_ord, rr_ord)),
+    slope_minutes = as.numeric(coef(lm(rr_ord ~ m_ord))[2]),
+    monotone_non_increasing_when_finer = all(diff(rev(rr_ord)) <= 1e-12)
+  )
+}, by = .(confidence_level, nominal_alpha)]
+
+setorder(sampling_trend, confidence_level)
+sampling_trend[]
+```
+
+# 12) Focused Conclusion for New Questions
+
+```{r focused-conclusion}
+cat("Leverage-level trend (more negative rho means larger |rho|):\n")
+print(leverage_trend)
+
+cat("\nSampling-interval trend (fixed rho =", sampling_fixed_rho, "):\n")
+print(sampling_trend)
+
+cat(
+  "\nInterpretation guide:\n",
+  "- Positive slope_abs_rho: stronger leverage (more negative rho) increases false rejections.\n",
+  "- Negative slope_minutes: finer sampling (smaller minute interval) increases false rejections.\n",
+  sep = ""
+)
+```

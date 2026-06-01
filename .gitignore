@@ -39,6 +39,7 @@ Thumbs.db
 
 # data
 /data/
+/features/
 *_l2/
 *_trade/
 *.zip

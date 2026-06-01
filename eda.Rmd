@@ -29,8 +29,8 @@ library(ggplot2)
 
 ```{r load-data}
 input_paths <- c(
-  "target/hf_2601_1m.csv",
-  "target/hf_2602_1m.csv"
+  "target/eth_2601_1m.csv",
+  "target/eth_2602_1m.csv"
 )
 
 missing_paths <- input_paths[!file.exists(input_paths)]

@@ -7,7 +7,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 ```
 
-## 1) Install and Load Packages
+# Install and Load Packages
 
 ```{r packages}
 required_pkgs <- c("highfrequency", "data.table")
@@ -22,12 +22,12 @@ library(highfrequency)
 library(data.table)
 ```
 
-## 2) Load Processed Data from okx-highfrequency
+# Load Processed Data from okx-highfrequency
 
 ```{r load-data}
 input_paths <- c(
-  "target/hf_2601_1m.csv",
-  "target/hf_2602_1m.csv"
+  "target/btc_2601_1m.csv",
+  "target/btc_2602_1m.csv"
 )
 
 missing_paths <- input_paths[!file.exists(input_paths)]
@@ -146,16 +146,15 @@ barplot(
 abline(h = 0, lty = 2, col = "gray40")
 ```
 
-## 3) Daily Jump Test (BNS)
+# Daily Jump Test (BNS)
 
-`BNSjumpTest` tests for jumps at the daily level when multi-day intraday prices are provided.
 
 ```{r daily-bns-test}
 # Controls sampling frequency used for the daily jump test.
 # If your raw data are 1-minute bars and you want 15-minute testing, set this to 15.
 # Set to 1 to use the original 1-minute sampling.
 daily_jump_align_by <- "minutes"
-daily_jump_align_period <- 2L
+daily_jump_align_period <- 15L
 
 # Two-sided daily significance level (5% => alpha quantile 0.975 in BNSjumpTest)
 daily_jump_sig_level <- 0.05
@@ -182,9 +181,8 @@ pData_daily_test <- pData_daily_test[DATE %in% valid_dates, .(DT, PRICE)]
 
 daily_bns <- BNSjumpTest(
   rData = pData_daily_test,
-  # IVestimator = "rMinRVar",
-  # IQestimator = "rMedRQuar",
   type = "ratio",
+  max = TRUE,
   makeReturns = TRUE,
   alpha = daily_jump_alpha_quantile
 )
@@ -251,31 +249,65 @@ daily_bns_reject
 daily_bns_summary
 ```
 
-## 4) Daily Jump Test (AJ, Optional Cross-Check)
-
-`AJjumpTest` is another daily jump test based on Ait-Sahalia and Jacod (2009).
-
-```{r daily-aj-test}
-daily_aj <- AJjumpTest(
-  pData = pData,
-  p = 4,
-  k = 2,
-  alignBy = "minutes",
-  alignPeriod = 15
-)
-
-daily_aj
-```
-
-## 5) Intraday Jump Test
+# Intraday Jump Test
 
 ```{r intraday-jump-test}
+# Keep these settings aligned with btc_daily_jump_long_horizon.Rmd section 10.
+intraday_lookback_period <- 90L
+intraday_align_by <- "minutes"
+intraday_align_period <- 5L
+intraday_market_open <- "00:00:00"
+intraday_market_close <- "23:59:59"
+intraday_tz <- "UTC"
+
 intraday_jumps <- intradayJumpTest(
   pData = pData,
-  # volEstimator = "RM",
-  # driftEstimator = "none",
-  # RM = "rBPCov",
+  lookBackPeriod = intraday_lookback_period,
+  alignBy = intraday_align_by,
+  alignPeriod = intraday_align_period,
+  marketOpen = intraday_market_open,
+  marketClose = intraday_market_close,
+  tz = intraday_tz
+)
+
+# intraday_jumps <- intradayJumpTest(
+#   pData = pData, 
+#   volEstimator = "PARM",
+#   # RM = "rBPCov",
+#   lookBackPeriod = 20,
+#   alignBy = "minutes",
+#   alignPeriod = 2,
+#   # theta = 1.2,
+#   marketOpen = "00:00:00",
+#   marketClose = "23:59:59",
+#   tz = "UTC"
+# )
+
+intraday_jumps
+
+cat(
+  "Intraday setting:",
+  "lookBack=", intraday_lookback_period, ", ",
+  "align=", intraday_align_period, " ", intraday_align_by, ", ",
+  "session=", intraday_market_open, "-", intraday_market_close, ", ",
+  "tz=", intraday_tz, "\n",
+  sep = ""
+)
+```
+
+```{r}
+plot(intraday_jumps)
+```
+
+### PARM
+
+```{r intraday-jump-test-parm}
+intraday_jumps_parm <- intradayJumpTest(
+  pData = pData,
+  volEstimator = "PARM",
+  RM = "rBPCov",
   lookBackPeriod = 20,
+  theta = 1.2,
   alignBy = "minutes",
   alignPeriod = 2,
   marketOpen = "00:00:00",
@@ -283,10 +315,14 @@ intraday_jumps <- intradayJumpTest(
   tz = "UTC"
 )
 
-intraday_jumps
+intraday_jumps_parm
 ```
 
-## 6) Daily + Intraday Jump Integration and Plot
+```{r}
+plot(intraday_jumps_parm)
+```
+
+# Summary and Visualization
 
 ```{r summarize-intraday-jumps}
 if (!inherits(intraday_jumps, "intradayJumpTest")) {
@@ -323,6 +359,27 @@ daily_intraday_jump_summary <- daily_intraday_jump_events[, .(
   intraday_jump_times = if (all(is.na(DT))) NA_character_ else paste(format(DT[!is.na(DT)], "%H:%M:%S"), collapse = ", ")
 ), by = DATE]
 
+
+
+### ALL ###
+daily_intraday_jump_events_all <- merge(
+  daily_bns_summary[, .(DATE, daily_ztest = ztest, daily_pvalue = pvalue)],
+  intraday_jump_events[, .(DATE, DT, intraday_ztest = ztest)],
+  by = "DATE",
+  all.x = TRUE
+)
+setorder(daily_intraday_jump_events_all, DATE, DT)
+
+daily_intraday_jump_summary_all <- daily_intraday_jump_events_all[, .(
+  daily_ztest = first(daily_ztest),
+  daily_pvalue = first(daily_pvalue),
+  intraday_jump_count = sum(!is.na(DT)),
+  intraday_jump_times = if (all(is.na(DT))) NA_character_ else paste(format(DT[!is.na(DT)], "%H:%M:%S"), collapse = ", ")
+), by = DATE]
+### ALL ###
+
+
+
 cat("Rows in daily-intraday event table:", nrow(daily_intraday_jump_events), "\n")
 cat("Daily reject days with at least one intraday jump:", sum(daily_intraday_jump_summary$intraday_jump_count > 0), "\n")
 
@@ -330,47 +387,22 @@ daily_intraday_jump_summary
 ```
 
 ```{r}
-intraday_df <- data.table(
-  DT = as.POSIXct(zoo::index(intraday_jumps$ztest), tz = "UTC"),
-  ztest = as.numeric(intraday_jumps$ztest)
-)
-intraday_df[, criticalValue := as.numeric(intraday_jumps$criticalValue)[1]]
-intraday_df[, jump_flag := !is.na(ztest) & is.finite(ztest) & (abs(ztest) > criticalValue)]
-intraday_df[, DATE := as.Date(DT, tz = "UTC")]
-
-daily_days <- unique(daily_bns_summary$DATE)
-intraday_jump_events <- intraday_df[jump_flag == TRUE]
-
-daily_intraday_jump_events <- merge(
-  daily_bns_summary[, .(DATE, daily_ztest = ztest, daily_pvalue = pvalue)],
-  intraday_jump_events[, .(DATE, DT, intraday_ztest = ztest)],
-  by = "DATE",
-  all.x = TRUE
-)
-setorder(daily_intraday_jump_events, DATE, DT)
-
-daily_intraday_jump_summary <- daily_intraday_jump_events[, .(
-  daily_ztest = first(daily_ztest),
-  daily_pvalue = first(daily_pvalue),
-  intraday_jump_count = sum(!is.na(DT)),
-  intraday_jump_times = if (all(is.na(DT))) NA_character_ else paste(format(DT[!is.na(DT)], "%H:%M:%S"), collapse = ", ")
-), by = DATE]
-
-cat("Rows in daily-intraday event table:", nrow(daily_intraday_jump_events), "\n")
-cat("Daily reject days with at least one intraday jump:", sum(daily_intraday_jump_summary$intraday_jump_count > 0), "\n")
-
-# daily_intraday_jump_summary
+daily_intraday_jump_summary_all
 ```
 
 ```{r}
 daily_intraday_jump_events
 ```
 
+```{r}
+daily_intraday_jump_events_all
+```
+
 ```{r intraday-plot-frequency-control}
 # Plot sampling control for BOTH section-6 plots.
 # Example: set to 15L to visualize at 15-minute resolution.
 plot_align_by <- "minutes"
-plot_align_period <- 2L
+plot_align_period <- 5L
 
 build_plot_prices <- function(pdata, align_by = "minutes", align_period = 1L, tz = "UTC") {
   out <- data.table::copy(pdata)
@@ -401,7 +433,7 @@ cat("Section-6 plotting resolution:", plot_align_period, plot_align_by, "\n")
 
 ```{r intraday-day-plot}
 # Choose which day to visualize (YYYY-MM-DD). If NULL, we pick the first day in daily_bns_reject.
-day_to_plot <- as.Date("2026-01-31")
+day_to_plot <- as.Date("2026-01-18")
 
 if (is.null(day_to_plot)) {
   if (nrow(daily_bns_reject) == 0) {
@@ -465,8 +497,8 @@ legend(
 
 ```{r intraday-day-zoom-plot}
 # Zoom control within the selected day_to_plot (HH:MM:SS, UTC)
-zoom_start_time <- "8:00:00"
-zoom_end_time <- "9:00:00"
+zoom_start_time <- "21:00:00"
+zoom_end_time <- "23:59:59"
 
 zoom_start_dt <- as.POSIXct(
   paste(as.character(day_to_plot), zoom_start_time),
@@ -533,9 +565,191 @@ legend(
   pch = c(NA, 19),
   bty = "n"
 )
+```
+
+### PARM
+
+```{r summarize-intraday-jumps-parm}
+if (!inherits(intraday_jumps_parm, "intradayJumpTest")) {
+  stop("Expected intraday_jumps_parm to be class intradayJumpTest.")
+}
+if (!xts::is.xts(intraday_jumps_parm$ztest)) {
+  stop("Expected intraday_jumps_parm$ztest to be xts.")
+}
+
+intraday_df_parm <- data.table(
+  DT = as.POSIXct(zoo::index(intraday_jumps_parm$ztest), tz = "UTC"),
+  ztest = as.numeric(intraday_jumps_parm$ztest)
+)
+intraday_df_parm[, criticalValue := as.numeric(intraday_jumps_parm$criticalValue)[1]]
+intraday_df_parm[, jump_flag := !is.na(ztest) & is.finite(ztest) & (abs(ztest) > criticalValue)]
+intraday_df_parm[, DATE := as.Date(DT, tz = "UTC")]
+
+daily_reject_days_parm <- unique(daily_bns_reject$DATE)
+intraday_jump_events_parm <- intraday_df_parm[jump_flag == TRUE]
+
+daily_intraday_jump_events_parm <- merge(
+  daily_bns_reject[, .(DATE, daily_ztest = ztest, daily_pvalue = pvalue)],
+  intraday_jump_events_parm[, .(DATE, DT, intraday_ztest = ztest)],
+  by = "DATE",
+  all.x = TRUE
+)
+setorder(daily_intraday_jump_events_parm, DATE, DT)
+
+daily_intraday_jump_summary_parm <- daily_intraday_jump_events_parm[, .(
+  daily_ztest = first(daily_ztest),
+  daily_pvalue = first(daily_pvalue),
+  intraday_jump_count = sum(!is.na(DT)),
+  intraday_jump_times = if (all(is.na(DT))) NA_character_ else paste(format(DT[!is.na(DT)], "%H:%M:%S"), collapse = ", ")
+), by = DATE]
+
+cat("Rows in PARM daily-intraday event table:", nrow(daily_intraday_jump_events_parm), "\n")
+cat("PARM daily reject days with at least one intraday jump:", sum(daily_intraday_jump_summary_parm$intraday_jump_count > 0), "\n")
+
+daily_intraday_jump_summary_parm
+```
+
+```{r summarize-intraday-jumps-parm-all-days}
+intraday_df_parm_all <- data.table(
+  DT = as.POSIXct(zoo::index(intraday_jumps_parm$ztest), tz = "UTC"),
+  ztest = as.numeric(intraday_jumps_parm$ztest)
+)
+intraday_df_parm_all[, criticalValue := as.numeric(intraday_jumps_parm$criticalValue)[1]]
+intraday_df_parm_all[, jump_flag := !is.na(ztest) & is.finite(ztest) & (abs(ztest) > criticalValue)]
+intraday_df_parm_all[, DATE := as.Date(DT, tz = "UTC")]
+
+daily_days_parm <- unique(daily_bns_summary$DATE)
+intraday_jump_events_parm_all <- intraday_df_parm_all[jump_flag == TRUE]
+
+daily_intraday_jump_events_all_parm <- merge(
+  daily_bns_summary[, .(DATE, daily_ztest = ztest, daily_pvalue = pvalue)],
+  intraday_jump_events_parm_all[, .(DATE, DT, intraday_ztest = ztest)],
+  by = "DATE",
+  all.x = TRUE
+)
+setorder(daily_intraday_jump_events_all_parm, DATE, DT)
+
+daily_intraday_jump_summary_all_parm <- daily_intraday_jump_events_all_parm[, .(
+  daily_ztest = first(daily_ztest),
+  daily_pvalue = first(daily_pvalue),
+  intraday_jump_count = sum(!is.na(DT)),
+  intraday_jump_times = if (all(is.na(DT))) NA_character_ else paste(format(DT[!is.na(DT)], "%H:%M:%S"), collapse = ", ")
+), by = DATE]
+
+cat("Rows in PARM all-days daily-intraday event table:", nrow(daily_intraday_jump_events_all_parm), "\n")
+cat("PARM days with at least one intraday jump:", sum(daily_intraday_jump_summary_all_parm$intraday_jump_count > 0), "\n")
+
+daily_intraday_jump_summary_all_parm
+```
+
+```{r}
+daily_intraday_jump_events_parm
+```
+
+```{r intraday-day-plot-parm}
+plot_intraday_parm <- intraday_df_parm[DATE == day_to_plot]
+plot_jump_points_parm <- plot_intraday_parm[jump_flag == TRUE, .(DT, ztest)]
+
+plot(
+  plot_prices$DT,
+  plot_prices$PRICE,
+  type = "l",
+  col = "black",
+  lwd = 1.2,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(
+    "Intraday Prices and Detected PARM Jumps on ", day_to_plot,
+    " (daily reject = ", day_to_plot %in% daily_reject_days_parm, ")"
+  )
+)
+
+if (nrow(plot_jump_points_parm) > 0) {
+  jump_plot_data_parm <- plot_prices[plot_jump_points_parm, on = "DT"]
+  points(
+    jump_plot_data_parm$DT,
+    jump_plot_data_parm$PRICE,
+    pch = 19,
+    col = "blue",
+    cex = 0.9
+  )
+  text(
+    jump_plot_data_parm$DT,
+    jump_plot_data_parm$PRICE,
+    labels = sprintf("z=%.2f", jump_plot_data_parm$ztest),
+    pos = 3,
+    cex = 0.7,
+    col = "blue"
+  )
+}
+
+legend(
+  "topleft",
+  legend = c("Price", "Detected PARM intraday jump"),
+  col = c("black", "blue"),
+  lty = c(1, NA),
+  pch = c(NA, 19),
+  bty = "n"
+)
+```
+
+```{r intraday-day-zoom-plot-parm}
+plot_jump_points_zoom_parm <- intraday_df_parm[
+  DATE == day_to_plot &
+    DT >= zoom_start_dt &
+    DT <= zoom_end_dt &
+    jump_flag == TRUE,
+  .(DT, ztest)
+]
+
+plot(
+  plot_prices_zoom$DT,
+  plot_prices_zoom$PRICE,
+  type = "l",
+  col = "black",
+  lwd = 1.2,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(
+    "Zoomed Intraday Prices on ", day_to_plot, " (",
+    zoom_start_time, " - ", zoom_end_time, " UTC, PARM)"
+  )
+)
+
+if (nrow(plot_jump_points_zoom_parm) > 0) {
+  jump_plot_zoom_parm <- plot_prices_zoom[plot_jump_points_zoom_parm, on = "DT"]
+  points(
+    jump_plot_zoom_parm$DT,
+    jump_plot_zoom_parm$PRICE,
+    pch = 19,
+    col = "blue",
+    cex = 0.9
+  )
+  text(
+    jump_plot_zoom_parm$DT,
+    jump_plot_zoom_parm$PRICE,
+    labels = sprintf("z=%.2f", jump_plot_zoom_parm$ztest),
+    pos = 3,
+    cex = 0.7,
+    col = "blue"
+  )
+}
+
+legend(
+  "topleft",
+  legend = c("Price", "Detected PARM intraday jump"),
+  col = c("black", "blue"),
+  lty = c(1, NA),
+  pch = c(NA, 19),
+  bty = "n"
+)
+```
+
+```{r}
 
 ```
 
 ```{r}
 
 ```
+

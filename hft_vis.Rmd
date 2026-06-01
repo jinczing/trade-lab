@@ -1,0 +1,546 @@
+---
+title: "OKX 0.1s Trades + L2 Structure Visualization"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1) Install and Load Packages
+
+```{r packages}
+required_pkgs <- c("data.table")
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_pkgs) > 0L) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_pkgs, collapse = ", "),
+    ". Install them before rendering this Rmd."
+  )
+}
+
+library(data.table)
+```
+
+# 2) OKX 0.1s Trades + L2 Structure (User-Selected Day/Window)
+
+```{r okx-hf-controls}
+# Data location produced by okx-features
+okx_hf_dir <- "target/okx_highfrequency"
+
+# User controls for visualization
+okx_hf_date <- as.Date("2025-08-24")
+okx_hf_window_start_time <- "19:00:00"  # UTC within okx_hf_date
+okx_hf_window_seconds <- 3600L            # short window length in seconds
+okx_hf_levels_to_plot <- 20L             # how many depth levels per side to visualize
+okx_hf_max_rows_for_plot <- 4000L        # optional downsampling for plotting speed
+
+# Python runtime controls for extractor
+# - default uses conda base env
+# - set okx_hf_conda_env <- "" to bypass conda and call python directly
+okx_hf_conda_executable <- Sys.getenv("CONDA_EXE", unset = "conda")
+okx_hf_conda_env <- "base"
+okx_hf_python_executable <- "python"
+```
+
+```{r okx-hf-load-window}
+extractor_script <- "scripts/extract_okx_feature_window.py"
+if (!file.exists(extractor_script)) {
+  stop("Missing extractor script: ", extractor_script)
+}
+if (!dir.exists(okx_hf_dir)) {
+  stop("Missing OKX feature directory: ", okx_hf_dir)
+}
+if (!is.finite(okx_hf_window_seconds) || okx_hf_window_seconds <= 0) {
+  stop("okx_hf_window_seconds must be positive.")
+}
+
+feature_files <- list.files(
+  okx_hf_dir,
+  pattern = "^features-\\d{4}-\\d{2}-\\d{2}-\\d{4}-\\d{2}-\\d{2}\\.parquet$",
+  full.names = TRUE
+)
+if (length(feature_files) == 0L) {
+  stop(
+    "No okx-features parquet file found in ",
+    okx_hf_dir,
+    " with expected name pattern features-YYYY-MM-DD-YYYY-MM-DD.parquet"
+  )
+}
+
+okx_feature_files <- data.table(
+  file_path = normalizePath(feature_files, winslash = "/", mustWork = TRUE)
+)
+okx_feature_files[, file_name := basename(file_path)]
+
+parsed_dates <- strcapture(
+  "^features-(\\d{4}-\\d{2}-\\d{2})-(\\d{4}-\\d{2}-\\d{2})\\.parquet$",
+  okx_feature_files$file_name,
+  proto = data.frame(
+    start_chr = character(),
+    end_chr = character(),
+    stringsAsFactors = FALSE
+  )
+)
+okx_feature_files[, `:=`(
+  start_date = as.Date(parsed_dates$start_chr),
+  end_date = as.Date(parsed_dates$end_chr)
+)]
+okx_feature_files <- okx_feature_files[!is.na(start_date) & !is.na(end_date)]
+setorder(okx_feature_files, start_date, end_date, file_name)
+
+if (nrow(okx_feature_files) == 0L) {
+  stop("Unable to parse date ranges from filenames in ", okx_hf_dir)
+}
+
+available_dates <- sort(unique(as.Date(unlist(
+  lapply(seq_len(nrow(okx_feature_files)), function(i) {
+    seq(okx_feature_files$start_date[i], okx_feature_files$end_date[i], by = "day")
+  })
+))))
+
+if (!(okx_hf_date %in% available_dates)) {
+  stop(
+    "Selected okx_hf_date ", as.character(okx_hf_date),
+    " is not available in ", okx_hf_dir,
+    ". Available range: ",
+    as.character(min(available_dates)), " to ", as.character(max(available_dates))
+  )
+}
+
+target_file_row <- okx_feature_files[
+  start_date <= okx_hf_date & end_date >= okx_hf_date
+][1]
+if (nrow(target_file_row) == 0L) {
+  stop("No feature file covers selected date: ", as.character(okx_hf_date))
+}
+okx_hf_file <- target_file_row$file_path
+
+okx_window_start <- as.POSIXct(
+  paste(as.character(okx_hf_date), okx_hf_window_start_time),
+  tz = "UTC"
+)
+if (is.na(okx_window_start)) {
+  stop("Cannot parse okx_hf_window_start_time: ", okx_hf_window_start_time)
+}
+okx_window_end <- okx_window_start + as.numeric(okx_hf_window_seconds)
+
+window_start_ms <- format(as.numeric(okx_window_start) * 1000, scientific = FALSE, trim = TRUE)
+window_end_ms <- format(as.numeric(okx_window_end) * 1000, scientific = FALSE, trim = TRUE)
+
+tmp_okx_csv <- tempfile("okx_hf_window_", fileext = ".csv")
+use_conda <- nzchar(okx_hf_conda_env)
+if (use_conda) {
+  conda_cmd <- okx_hf_conda_executable
+  if (!grepl("[/\\\\]", conda_cmd)) {
+    resolved_conda <- Sys.which(conda_cmd)
+    if (!nzchar(resolved_conda)) {
+      stop(
+        "Conda executable not found in PATH: ", conda_cmd,
+        ". Set okx_hf_conda_executable to a full path or update PATH."
+      )
+    }
+    conda_cmd <- resolved_conda
+  } else if (!file.exists(conda_cmd)) {
+    stop("Conda executable path does not exist: ", conda_cmd)
+  }
+
+  extractor_cmd <- conda_cmd
+  extractor_args <- c(
+    "run", "-n", okx_hf_conda_env,
+    okx_hf_python_executable,
+    extractor_script,
+    "--input", okx_hf_file,
+    "--output", tmp_okx_csv,
+    "--start-ms", window_start_ms,
+    "--end-ms", window_end_ms
+  )
+} else {
+  extractor_cmd <- okx_hf_python_executable
+  extractor_args <- c(
+    extractor_script,
+    "--input", okx_hf_file,
+    "--output", tmp_okx_csv,
+    "--start-ms", window_start_ms,
+    "--end-ms", window_end_ms
+  )
+}
+
+extract_log <- system2(
+  extractor_cmd,
+  args = extractor_args,
+  stdout = TRUE,
+  stderr = TRUE
+)
+extract_status <- attr(extract_log, "status")
+if (!is.null(extract_status) && extract_status != 0L) {
+  stop(
+    "Failed to extract OKX window from parquet. Exit code=", extract_status,
+    "\n", paste(extract_log, collapse = "\n")
+  )
+}
+if (!file.exists(tmp_okx_csv)) {
+  stop("Extractor did not produce output CSV: ", tmp_okx_csv)
+}
+
+okx_window <- fread(tmp_okx_csv)
+if (nrow(okx_window) == 0L) {
+  stop(
+    "No rows found in selected window: ",
+    format(okx_window_start, "%Y-%m-%d %H:%M:%S"),
+    " to ",
+    format(okx_window_end, "%Y-%m-%d %H:%M:%S"),
+    " UTC"
+  )
+}
+
+okx_window[, DT := as.POSIXct(timestamp / 1000, origin = "1970-01-01", tz = "UTC")]
+setorder(okx_window, timestamp)
+
+ask_price_cols_all <- grep("^ask_price_\\d+$", names(okx_window), value = TRUE)
+bid_price_cols_all <- grep("^bid_price_\\d+$", names(okx_window), value = TRUE)
+ask_size_cols_all <- grep("^ask_size_\\d+$", names(okx_window), value = TRUE)
+bid_size_cols_all <- grep("^bid_size_\\d+$", names(okx_window), value = TRUE)
+
+if (length(ask_price_cols_all) == 0L || length(bid_price_cols_all) == 0L) {
+  stop("Depth price columns are missing. Ensure okx-features was generated with --include-price.")
+}
+if (length(ask_size_cols_all) == 0L || length(bid_size_cols_all) == 0L) {
+  stop("Depth size columns are missing from selected file.")
+}
+
+extract_level <- function(col_names) as.integer(sub(".*_(\\d+)$", "\\1", col_names))
+ask_price_cols_all <- ask_price_cols_all[order(extract_level(ask_price_cols_all))]
+bid_price_cols_all <- bid_price_cols_all[order(extract_level(bid_price_cols_all))]
+ask_size_cols_all <- ask_size_cols_all[order(extract_level(ask_size_cols_all))]
+bid_size_cols_all <- bid_size_cols_all[order(extract_level(bid_size_cols_all))]
+
+levels_available <- min(
+  length(ask_price_cols_all),
+  length(bid_price_cols_all),
+  length(ask_size_cols_all),
+  length(bid_size_cols_all)
+)
+if (levels_available < 1L) {
+  stop("No usable depth levels found in selected window.")
+}
+levels_to_plot <- min(as.integer(okx_hf_levels_to_plot), levels_available)
+
+ask_price_cols <- ask_price_cols_all[seq_len(levels_to_plot)]
+bid_price_cols <- bid_price_cols_all[seq_len(levels_to_plot)]
+ask_size_cols <- ask_size_cols_all[seq_len(levels_to_plot)]
+bid_size_cols <- bid_size_cols_all[seq_len(levels_to_plot)]
+
+okx_window[, midquote := (ask_price_1 + bid_price_1) / 2]
+okx_window[, trade_volume := pmax(buy_volume, 0) + pmax(sell_volume, 0)]
+okx_window[, trade_imbalance := buy_volume - sell_volume]
+okx_window[, has_trade := trade_volume > 0 & vwap > 0]
+
+if (nrow(okx_window) > okx_hf_max_rows_for_plot) {
+  keep_idx <- unique(round(seq(1, nrow(okx_window), length.out = okx_hf_max_rows_for_plot)))
+  okx_plot <- okx_window[keep_idx]
+} else {
+  okx_plot <- copy(okx_window)
+}
+
+cat("Selected feature file:", okx_hf_file, "\n")
+cat("Selected day:", as.character(okx_hf_date), "\n")
+cat(
+  "Window:",
+  format(okx_window_start, "%Y-%m-%d %H:%M:%S"),
+  "to",
+  format(okx_window_end, "%Y-%m-%d %H:%M:%S"),
+  "UTC\n"
+)
+if (use_conda) {
+  cat("Extractor runtime: conda env", okx_hf_conda_env, "\n")
+} else {
+  cat("Extractor runtime: direct python\n")
+}
+# cat("Rows in window:", nrow(okx_window), "| Rows used for plotting:", nrow(okx_plot), "\n")
+# cat("Depth levels plotted per side:", levels_to_plot, "\n")
+# cat("Extractor log:\n", paste(extract_log, collapse = "\n"), "\n")
+```
+
+```{r okx-hf-available-dates}
+data.table(
+  selected_date = okx_hf_date,
+  available_start = min(available_dates),
+  available_end = max(available_dates),
+  n_available_days = length(available_dates)
+)
+```
+
+```{r okx-hf-microstructure-overview}
+old_par <- par(no.readonly = TRUE)
+on.exit(par(old_par))
+# par(mfrow = c(2, 2), mar = c(3.5, 4, 2.5, 1))
+
+main_prefix <- paste0(
+  "OKX BTC-USDT 0.1s microstructure | ",
+  format(okx_window_start, "%Y-%m-%d %H:%M:%S"),
+  " to ",
+  format(okx_window_end, "%H:%M:%S"),
+  " UTC"
+)
+
+# (1) Top-of-book + trade VWAP
+plot(
+  okx_plot$DT, okx_plot$ask_price_1,
+  type = "l",
+  col = "firebrick3",
+  lwd = 1.0,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(main_prefix, "\nTop-of-book quotes + trades")
+)
+lines(okx_plot$DT, okx_plot$bid_price_1, col = "steelblue4", lwd = 1.0)
+lines(okx_plot$DT, okx_plot$midquote, col = "black", lwd = 1.1, lty = 2)
+trade_points <- okx_plot[has_trade == TRUE]
+if (nrow(trade_points) > 0L) {
+  max_trade_size <- max(trade_points$trade_volume, na.rm = TRUE)
+  if (!is.finite(max_trade_size) || max_trade_size <= 0) {
+    max_trade_size <- 1
+  }
+  points(
+    trade_points$DT,
+    trade_points$vwap,
+    pch = 16,
+    col = rgb(0.15, 0.15, 0.15, 0.40),
+    cex = 0.4 + 1.8 * (trade_points$trade_volume / max_trade_size)
+  )
+}
+legend(
+  "topleft",
+  legend = c("Ask1", "Bid1", "Midquote", "VWAP trade prints"),
+  col = c("firebrick3", "steelblue4", "black", rgb(0.15, 0.15, 0.15, 0.40)),
+  lty = c(1, 1, 2, NA),
+  pch = c(NA, NA, NA, 16),
+  bty = "n",
+  cex = 0.8
+)
+
+# (2) Buy/Sell flow in each 0.1s bucket
+trade_ylim <- max(abs(c(okx_plot$buy_volume, okx_plot$sell_volume)), na.rm = TRUE)
+if (!is.finite(trade_ylim) || trade_ylim <= 0) {
+  trade_ylim <- 1
+}
+plot(
+  okx_plot$DT,
+  okx_plot$buy_volume,
+  type = "h",
+  col = rgb(0.10, 0.60, 0.10, 0.75),
+  lwd = 1.2,
+  ylim = c(-trade_ylim, trade_ylim),
+  xlab = "Time (UTC)",
+  ylab = "Volume",
+  main = "Trade Flow per 0.1s bucket (buy + / sell -)"
+)
+segments(
+  x0 = okx_plot$DT,
+  y0 = 0,
+  x1 = okx_plot$DT,
+  y1 = -okx_plot$sell_volume,
+  col = rgb(0.80, 0.15, 0.15, 0.75),
+  lwd = 1.2
+)
+abline(h = 0, lty = 2, col = "gray40")
+legend(
+  "topright",
+  legend = c("Buy volume", "Sell volume"),
+  col = c(rgb(0.10, 0.60, 0.10, 0.75), rgb(0.80, 0.15, 0.15, 0.75)),
+  lty = 1,
+  bty = "n",
+  cex = 0.8
+)
+
+# (3) Full bid/ask price ladder for selected levels
+ask_price_mat <- as.matrix(okx_plot[, ..ask_price_cols])
+bid_price_mat <- as.matrix(okx_plot[, ..bid_price_cols])
+price_ylim <- range(c(ask_price_mat, bid_price_mat), finite = TRUE)
+plot(
+  okx_plot$DT,
+  ask_price_mat[, 1],
+  type = "n",
+  ylim = price_ylim,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0("Depth Price Ladders (levels 1-", levels_to_plot, ")")
+)
+matlines(okx_plot$DT, ask_price_mat, col = rgb(0.85, 0.20, 0.20, 0.35), lty = 1, lwd = 0.8)
+matlines(okx_plot$DT, bid_price_mat, col = rgb(0.15, 0.35, 0.85, 0.35), lty = 1, lwd = 0.8)
+lines(okx_plot$DT, okx_plot$midquote, col = "black", lwd = 1.0, lty = 2)
+legend(
+  "topleft",
+  legend = c("Ask ladder", "Bid ladder", "Midquote"),
+  col = c(rgb(0.85, 0.20, 0.20, 0.60), rgb(0.15, 0.35, 0.85, 0.60), "black"),
+  lty = c(1, 1, 2),
+  bty = "n",
+  cex = 0.8
+)
+
+
+```
+
+```{r}
+# (4) Full bid/ask size ladder for selected levels
+ask_size_mat <- as.matrix(okx_plot[, ..ask_size_cols])
+bid_size_mat <- as.matrix(okx_plot[, ..bid_size_cols])
+ask_size_sum <- rowSums(ask_size_mat[, 1:levels_to_plot, drop = FALSE], na.rm = TRUE)
+bid_size_sum <- rowSums(bid_size_mat[, 1:levels_to_plot, drop = FALSE], na.rm = TRUE)
+size_max <- max(c(ask_size_sum, bid_size_sum), na.rm = TRUE)
+size_ylim <- c(-1.05 * size_max, 1.05 * size_max)
+plot(
+  okx_plot$DT,
+  ask_size_sum,
+  type = "n",
+  ylim = size_ylim,
+  xlab = "Time (UTC)",
+  ylab = "Size",
+  main = paste0("Cumulative Size (Depth levels 1-", levels_to_plot, ")")
+)
+lines(okx_plot$DT, ask_size_sum, col = rgb(0.85, 0.20, 0.20, 1), lty = 1, lwd = 0.8)
+lines(okx_plot$DT, -bid_size_sum, col = rgb(0.15, 0.35, 0.85, 1), lty = 1, lwd = 0.8)
+abline(h = 0, lty = 2, col = "gray40")
+legend(
+  "topright",
+  legend = c("Ask size sum", "Bid size sum (negative)"),
+  col = c(rgb(0.85, 0.20, 0.20, 0.60), rgb(0.15, 0.35, 0.85, 0.60)),
+  lty = 1,
+  bty = "n",
+  cex = 0.8
+)
+```
+
+
+
+```{r okx-hf-spread-over-period}
+# Inspired by the attached spread figure, but adapted to this dataset:
+# - spread here is strictly top-of-book quote spread (ask_price_1 - bid_price_1)
+# - x-axis is UTC time at 0.1s snapshots from okx-features
+# - we annotate spikes and add bps context instead of copying the original chart style
+
+spread_dt <- okx_window[
+  is.finite(ask_price_1) & is.finite(bid_price_1),
+  .(DT, ask_price_1, bid_price_1, midquote, trade_volume)
+]
+spread_dt[, spread_usd := ask_price_1 - bid_price_1]
+spread_dt <- spread_dt[is.finite(spread_usd) & spread_usd >= 0]
+
+if (nrow(spread_dt) == 0L) {
+  stop("No valid spread observations in selected window.")
+}
+
+spread_dt[, spread_bps := fifelse(midquote > 0, 1e4 * spread_usd / midquote, NA_real_)]
+
+# Mark extreme spread observations (upper 1% by default) and highlight neighborhood of max spread.
+spread_q99 <- as.numeric(quantile(spread_dt$spread_usd, probs = 0.99, na.rm = TRUE, type = 7))
+spread_dt[, is_spike := spread_usd >= spread_q99]
+
+peak_idx <- which.max(spread_dt$spread_usd)
+peak_time <- spread_dt$DT[peak_idx]
+highlight_half_seconds <- min(10, max(2, floor(okx_hf_window_seconds / 20)))
+highlight_start <- peak_time - highlight_half_seconds
+highlight_end <- peak_time + highlight_half_seconds
+
+# Robust baseline trend (running median); fallback to raw series for very short windows.
+if (nrow(spread_dt) < 3L) {
+  spread_dt[, spread_trend := spread_usd]
+} else {
+  trend_k <- min(101L, nrow(spread_dt))
+  if (trend_k %% 2L == 0L) {
+    trend_k <- trend_k - 1L
+  }
+  if (trend_k < 3L) {
+    trend_k <- 3L
+  }
+  spread_dt[, spread_trend := stats::runmed(spread_usd, k = trend_k, endrule = "keep")]
+}
+
+y_lim <- c(0, max(spread_dt$spread_usd, na.rm = TRUE) * 1.05)
+if (!is.finite(y_lim[2]) || y_lim[2] <= 0) {
+  y_lim <- c(0, 1)
+}
+
+plot(
+  spread_dt$DT,
+  spread_dt$spread_usd,
+  type = "n",
+  ylim = y_lim,
+  xlab = "Time (UTC)",
+  ylab = "Spread (USD)",
+  main = paste0(
+    "BTC-USDT Top-of-Book Spread | ",
+    format(okx_window_start, "%Y-%m-%d %H:%M:%S"),
+    " to ",
+    format(okx_window_end, "%H:%M:%S"),
+    " UTC"
+  )
+)
+
+rect(
+  xleft = highlight_start,
+  ybottom = par("usr")[3],
+  xright = highlight_end,
+  ytop = par("usr")[4],
+  col = rgb(0.80, 0.80, 0.80, 0.35),
+  border = NA
+)
+
+points(
+  spread_dt$DT,
+  spread_dt$spread_usd,
+  pch = 16,
+  cex = 0.35,
+  col = rgb(0.05, 0.05, 0.05, 0.45)
+)
+
+if (any(spread_dt$is_spike, na.rm = TRUE)) {
+  points(
+    spread_dt[is_spike == TRUE, DT],
+    spread_dt[is_spike == TRUE, spread_usd],
+    pch = 16,
+    cex = 0.45,
+    col = rgb(0.80, 0.10, 0.10, 0.70)
+  )
+}
+
+lines(spread_dt$DT, spread_dt$spread_trend, col = "steelblue4", lwd = 1.2)
+abline(h = median(spread_dt$spread_usd, na.rm = TRUE), col = "gray45", lty = 2, lwd = 1)
+abline(h = spread_q99, col = "firebrick4", lty = 3, lwd = 1)
+
+legend(
+  "topright",
+  legend = c("Spread snapshots", "Spike (>=99th pct)", "Running median", "Median", "99th percentile", "Peak-spread neighborhood"),
+  col = c(
+    rgb(0.05, 0.05, 0.05, 0.55),
+    rgb(0.80, 0.10, 0.10, 0.80),
+    "steelblue4",
+    "gray45",
+    "firebrick4",
+    rgb(0.80, 0.80, 0.80, 0.80)
+  ),
+  pch = c(16, 16, NA, NA, NA, 15),
+  lty = c(NA, NA, 1, 2, 3, NA),
+  pt.cex = c(0.6, 0.7, NA, NA, NA, 1.0),
+  bty = "n",
+  cex = 0.8
+)
+
+cat(
+  "Spread summary: median=",
+  sprintf("%.6f", median(spread_dt$spread_usd, na.rm = TRUE)),
+  "USD, q99=",
+  sprintf("%.6f", spread_q99),
+  "USD, max=",
+  sprintf("%.6f", max(spread_dt$spread_usd, na.rm = TRUE)),
+  "USD at ",
+  format(peak_time, "%Y-%m-%d %H:%M:%OS3"),
+  " UTC; median spread=",
+  sprintf("%.4f", ifelse(all(is.na(spread_dt$spread_bps)), NA_real_, median(spread_dt$spread_bps, na.rm = TRUE))),
+  " bps.\n",
+  sep = ""
+)
+```

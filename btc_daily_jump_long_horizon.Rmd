@@ -1,0 +1,1882 @@
+---
+title: "BTC Long-Horizon Daily Jump Tests (Binance 1m)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1) Install and Load Packages
+
+```{r packages}
+required_pkgs <- c("highfrequency", "data.table", "xts", "zoo")
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_pkgs) > 0L) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_pkgs, collapse = ", "),
+    ". Install them before rendering this Rmd."
+  )
+}
+
+library(highfrequency)
+library(data.table)
+library(xts)
+library(zoo)
+```
+
+# 2) Load BTC Binance 1m Data
+
+```{r load-data}
+input_path <- "data/okx_1m/BTCUSDT_1m_2025-01-01_to_2026-05-31.csv.gz"
+if (!file.exists(input_path)) {
+  stop("Missing input file: ", input_path)
+}
+
+if (requireNamespace("R.utils", quietly = TRUE)) {
+  raw_btc <- fread(
+    input_path,
+    select = c("open_time", "open_time_ms", "close")
+  )
+} else {
+  raw_btc <- as.data.table(
+    read.csv(
+      gzfile(input_path),
+      stringsAsFactors = FALSE
+    )
+  )[, .(open_time, open_time_ms, close)]
+}
+
+raw_btc[, DT := suppressWarnings(as.POSIXct(open_time, tz = "UTC"))]
+if (all(is.na(raw_btc$DT))) {
+  raw_btc[, DT := as.POSIXct(open_time_ms / 1000, origin = "1970-01-01", tz = "UTC")]
+}
+
+raw_btc[, PRICE := as.numeric(close)]
+pData <- raw_btc[
+  is.finite(PRICE) & PRICE > 0 & !is.na(DT),
+  .(DT, PRICE)
+]
+setorder(pData, DT)
+
+cat("Input file:", input_path, "\n")
+cat("Rows after cleanup:", nrow(pData), "\n")
+cat("Date range:", format(min(pData$DT), "%Y-%m-%d %H:%M:%S"), "to", format(max(pData$DT), "%Y-%m-%d %H:%M:%S"), "UTC\n")
+head(pData)
+```
+
+```{r}
+pData
+```
+
+# 3) Parameters and Helper Functions
+
+```{r helpers}
+sample_freq_grid <- c(1L, 2L, 5L, 15L, 30L, 60L, 120L)
+confidence_grid <- c(0.90, 0.95, 0.99)
+default_confidence <- 0.95
+acf_lag_max <- 5L
+plot_freqs <- c(1L, 5L, 30L, 120L)
+
+resample_prices <- function(pdata, freq_mins, tz = "UTC") {
+  out <- copy(pdata)
+  if (freq_mins > 1L) {
+    out <- aggregatePrice(
+      out,
+      alignBy = "minutes",
+      alignPeriod = freq_mins,
+      marketOpen = "00:00:00",
+      marketClose = "23:59:59",
+      tz = tz
+    )
+  }
+
+  out <- as.data.table(out)
+  out <- out[is.finite(PRICE) & PRICE > 0 & !is.na(DT)]
+  setorder(out, DT)
+
+  out[, DATE := as.Date(DT, tz = tz)]
+  valid_dates <- out[, .N, by = DATE][N > 1L, DATE]
+  out <- out[DATE %in% valid_dates, .(DT, PRICE)]
+  setorder(out, DT)
+  out
+}
+
+compute_return_acf_summary <- function(sampled_pdata, lag_max = 5L) {
+  tmp <- copy(sampled_pdata)
+  tmp[, ret := log(PRICE) - shift(log(PRICE), type = "lag")]
+  ret <- tmp[is.finite(ret), ret]
+
+  if (length(ret) < (lag_max + 1L)) {
+    return(data.table(
+      n_returns = length(ret),
+      lag1_acf = NA_real_,
+      lag1_to_lag5_acf_sum = NA_real_,
+      lag1_to_lag5_acf_abs_sum = NA_real_
+    ))
+  }
+
+  acf_obj <- stats::acf(ret, plot = FALSE, lag.max = lag_max, na.action = na.pass)
+  lag_vals <- as.numeric(acf_obj$acf[2:(lag_max + 1L)])
+
+  data.table(
+    n_returns = length(ret),
+    lag1_acf = lag_vals[1],
+    lag1_to_lag5_acf_sum = sum(lag_vals, na.rm = TRUE),
+    lag1_to_lag5_acf_abs_sum = sum(abs(lag_vals), na.rm = TRUE)
+  )
+}
+
+to_numeric_xts <- function(x) {
+  as.numeric(zoo::coredata(x))
+}
+
+daywise_noise_robust <- function(sampled_pdata, estimator = c("rTSCov", "rRTSCov"), tz = "UTC") {
+  estimator <- match.arg(estimator)
+  px_xts <- xts(sampled_pdata$PRICE, order.by = sampled_pdata$DT, tzone = tz)
+  day_index <- as.Date(index(px_xts), tz = tz)
+  split_rows <- split(seq_along(day_index), day_index)
+
+  out <- rbindlist(lapply(names(split_rows), function(d) {
+    rows <- split_rows[[d]]
+    x_day <- px_xts[rows]
+    n_obs <- NROW(x_day)
+
+    if (n_obs < 20L) {
+      return(data.table(DATE = as.Date(d), value = NA_real_, n_obs = n_obs))
+    }
+
+    K_use <- max(2L, floor((n_obs - 1L) / 10L))
+    K_use <- min(K_use, 50L)
+    J_use <- 1L
+
+    est_val <- tryCatch(
+      {
+        if (estimator == "rTSCov") {
+          as.numeric(rTSCov(x_day, K = K_use, J = J_use))
+        } else {
+          as.numeric(rRTSCov(x_day, K = K_use, J = J_use))
+        }
+      },
+      error = function(e) NA_real_
+    )
+
+    data.table(DATE = as.Date(d), value = est_val, n_obs = n_obs)
+  }), fill = TRUE)
+
+  setorder(out, DATE)
+  out
+}
+
+extract_daily_bns_summary <- function(obj, confidence_level, tz = "UTC") {
+  sig_level <- 1 - confidence_level
+
+  if (is.list(obj) && !xts::is.xts(obj) && length(obj) > 0 && is.list(obj[[1]])) {
+    out <- rbindlist(lapply(seq_along(obj), function(i) {
+      x <- obj[[i]]
+      crit <- as.numeric(x$critical.value)
+      dname <- if (!is.null(names(obj))) names(obj)[i] else NA_character_
+      data.table(
+        DATE = suppressWarnings(as.Date(dname)),
+        ztest = as.numeric(x$ztest)[1],
+        critical_lower = if (length(crit) >= 1) crit[1] else NA_real_,
+        critical_upper = if (length(crit) >= 2) crit[2] else NA_real_,
+        pvalue = as.numeric(x$pvalue)[1]
+      )
+    }), fill = TRUE)
+  } else if (xts::is.xts(obj)) {
+    raw_tbl <- data.table(
+      DATE = as.Date(zoo::index(obj), tz = tz),
+      as.data.frame(zoo::coredata(obj), check.names = FALSE)
+    )
+    p_col <- grep("^p.?value$|p-value|pvalue", names(raw_tbl), ignore.case = TRUE, value = TRUE)[1]
+    z_col <- grep("^z.?test$|^ztest$", names(raw_tbl), ignore.case = TRUE, value = TRUE)[1]
+    lo_col <- grep("^lower$|critical.*lower", names(raw_tbl), ignore.case = TRUE, value = TRUE)[1]
+    up_col <- grep("^upper$|critical.*upper", names(raw_tbl), ignore.case = TRUE, value = TRUE)[1]
+
+    out <- raw_tbl[, .(
+      DATE,
+      ztest = as.numeric(get(z_col)),
+      critical_lower = as.numeric(get(lo_col)),
+      critical_upper = as.numeric(get(up_col)),
+      pvalue = as.numeric(get(p_col))
+    )]
+  } else {
+    stop("Unsupported BNSjumpTest output class: ", paste(class(obj), collapse = ", "))
+  }
+
+  out[, reject_null := !is.na(pvalue) & (pvalue < sig_level)]
+  out[, confidence_level := confidence_level]
+  setorder(out, DATE)
+  out
+}
+
+run_daily_bns <- function(sampled_pdata, confidence_level) {
+  alpha_quantile <- 1 - (1 - confidence_level) / 2
+
+  # Default structure requested by user:
+  # daily_bns <- BNSjumpTest(
+  #   rData = pData_daily_test,
+  #   type = "ratio",
+  #   max = TRUE,
+  #   makeReturns = TRUE
+  # )
+  bns_obj <- BNSjumpTest(
+    rData = sampled_pdata,
+    type = "ratio",
+    max = TRUE,
+    makeReturns = TRUE,
+    alpha = alpha_quantile
+  )
+
+  extract_daily_bns_summary(
+    bns_obj,
+    confidence_level = confidence_level,
+    tz = "UTC"
+  )
+}
+```
+
+# 4) Run Long-Horizon Frequency/Confidence Grid
+
+```{r run-grid}
+grid_results <- lapply(sample_freq_grid, function(freq_mins) {
+  sampled <- resample_prices(pData, freq_mins = freq_mins, tz = "UTC")
+  acf_summary <- compute_return_acf_summary(sampled, lag_max = acf_lag_max)
+  acf_summary[, sample_minutes := freq_mins]
+
+  daily_details <- rbindlist(lapply(confidence_grid, function(conf_lvl) {
+    daily <- run_daily_bns(sampled, confidence_level = conf_lvl)
+    daily[, `:=`(
+      sample_minutes = freq_mins,
+      alpha_quantile = 1 - (1 - conf_lvl) / 2
+    )]
+    daily
+  }), fill = TRUE)
+
+  jump_summary <- daily_details[, .(
+    n_test_days = .N,
+    reject_days = sum(reject_null, na.rm = TRUE),
+    rejection_rate = mean(reject_null, na.rm = TRUE),
+    mean_ratio_stat = mean(ztest, na.rm = TRUE),
+    mean_critical_lower = mean(critical_lower, na.rm = TRUE),
+    mean_pvalue = mean(pvalue, na.rm = TRUE)
+  ), by = .(sample_minutes, confidence_level, alpha_quantile)]
+
+  list(
+    acf_summary = acf_summary,
+    daily_details = daily_details,
+    jump_summary = jump_summary
+  )
+})
+
+acf_summary_all <- rbindlist(lapply(grid_results, `[[`, "acf_summary"), fill = TRUE)
+daily_details_all <- rbindlist(lapply(grid_results, `[[`, "daily_details"), fill = TRUE)
+jump_summary_all <- rbindlist(lapply(grid_results, `[[`, "jump_summary"), fill = TRUE)
+
+setorder(acf_summary_all, sample_minutes)
+setorder(jump_summary_all, sample_minutes, confidence_level)
+setorder(daily_details_all, sample_minutes, confidence_level, DATE)
+```
+
+# 5) Autocorrelation Diagnostics by Sampling Frequency
+
+```{r acf-table}
+acf_summary_all
+```
+
+```{r acf-plot}
+barplot(
+  height = acf_summary_all$lag1_to_lag5_acf_sum,
+  names.arg = acf_summary_all$sample_minutes,
+  xlab = "Sampling Frequency (minutes)",
+  ylab = "Sum of ACF (lags 1 to 5)",
+  main = "BTC Return Serial Correlation by Sampling Frequency",
+  col = "steelblue"
+)
+abline(h = 0, lty = 2, col = "gray40")
+```
+
+```{r microstructure-summary-table}
+microstructure_summary_all <- rbindlist(lapply(sample_freq_grid, function(freq_mins) {
+  sampled <- resample_prices(pData, freq_mins = freq_mins, tz = "UTC")
+
+  sampled[, ret := log(PRICE) - shift(log(PRICE), type = "lag")]
+  ret_vec <- sampled[is.finite(ret), ret]
+
+  lag1_acf <- if (length(ret_vec) > 1L) {
+    cor(ret_vec[-1], ret_vec[-length(ret_vec)])
+  } else {
+    NA_real_
+  }
+
+  ljung_p <- if (length(ret_vec) > 20L) {
+    Box.test(ret_vec, lag = 10L, type = "Ljung-Box")$p.value
+  } else {
+    NA_real_
+  }
+
+  px_xts <- xts(sampled$PRICE, order.by = sampled$DT, tzone = "UTC")
+  rv_xts <- rCov(px_xts, makeReturns = TRUE)
+  bp_xts <- rBPCov(px_xts, makeReturns = TRUE)
+  rk_xts <- suppressWarnings(rKernelCov(px_xts, makeReturns = TRUE))
+
+  rv_vec <- to_numeric_xts(rv_xts)
+  bp_vec <- to_numeric_xts(bp_xts)
+  rk_vec <- to_numeric_xts(rk_xts)
+  rk_vec[rk_vec < 0] <- NA_real_
+
+  ts_tbl <- daywise_noise_robust(sampled, estimator = "rTSCov", tz = "UTC")
+  rts_tbl <- daywise_noise_robust(sampled, estimator = "rRTSCov", tz = "UTC")
+
+  data.table(
+    sample_minutes = freq_mins,
+    n_intraday_returns = length(ret_vec),
+    lag1_return_acf = lag1_acf,
+    ljung_box_pvalue_lag10 = ljung_p,
+    mean_daily_rv = mean(rv_vec, na.rm = TRUE),
+    mean_daily_bp = mean(bp_vec, na.rm = TRUE),
+    mean_daily_rk = mean(rk_vec, na.rm = TRUE),
+    mean_daily_ts = mean(ts_tbl$value, na.rm = TRUE),
+    mean_daily_rts = mean(rts_tbl$value, na.rm = TRUE),
+    rv_minus_rk = mean(rv_vec - rk_vec, na.rm = TRUE),
+    rv_minus_rts = mean(rv_vec - rts_tbl$value, na.rm = TRUE)
+  )
+}), fill = TRUE)
+
+setorder(microstructure_summary_all, sample_minutes)
+microstructure_summary_all
+```
+
+```{r microstructure-signature-plot}
+plot(
+  microstructure_summary_all$sample_minutes,
+  microstructure_summary_all$mean_daily_rv,
+  type = "b",
+  pch = 19,
+  col = "firebrick",
+  xlab = "Sampling Frequency (minutes)",
+  ylab = "Mean Daily RV",
+  main = "Volatility Signature Plot"
+)
+```
+
+```{r microstructure-lag1-plot}
+plot(
+  microstructure_summary_all$sample_minutes,
+  microstructure_summary_all$lag1_return_acf,
+  type = "b",
+  pch = 19,
+  col = "darkgreen",
+  xlab = "Sampling Frequency (minutes)",
+  ylab = "Lag-1 Return ACF",
+  main = "Lag-1 Return Autocorrelation by Sampling Frequency"
+)
+abline(h = 0, lty = 2, col = "gray40")
+```
+
+```{r microstructure-noise-gap-plot}
+plot(
+  microstructure_summary_all$sample_minutes,
+  microstructure_summary_all$rv_minus_rk,
+  type = "b",
+  pch = 19,
+  col = "navy",
+  xlab = "Sampling Frequency (minutes)",
+  ylab = "Mean(RV - RK)",
+  main = "Noise Gap by Sampling Frequency"
+)
+abline(h = 0, lty = 2, col = "gray40")
+```
+
+# 5.5) Leverage Effects
+
+```{r leverage-effects-summary}
+leverage_summary_all <- rbindlist(lapply(sample_freq_grid, function(freq_mins) {
+  sampled <- resample_prices(pData, freq_mins = freq_mins, tz = "UTC")
+  sampled[, DATE := as.Date(DT, tz = "UTC")]
+
+  daily_close <- sampled[, .(close_price = PRICE[.N]), by = DATE][order(DATE)]
+  daily_close[, ret_t := log(close_price) - shift(log(close_price), type = "lag")]
+
+  px_xts <- xts(sampled$PRICE, order.by = sampled$DT, tzone = "UTC")
+  rv_xts <- rCov(px_xts, makeReturns = TRUE)
+  vol_tbl <- data.table(
+    DATE = as.Date(zoo::index(rv_xts), tz = "UTC"),
+    rv = to_numeric_xts(rv_xts)
+  )
+  vol_tbl[, vol_t := sqrt(pmax(rv, 0))]
+  vol_tbl[, dvol_t_to_t1 := shift(vol_t, type = "lead") - vol_t]
+
+  lev_tbl <- merge(
+    daily_close[, .(DATE, ret_t)],
+    vol_tbl[, .(DATE, vol_t, dvol_t_to_t1)],
+    by = "DATE",
+    all = FALSE
+  )
+
+  valid <- lev_tbl[is.finite(ret_t) & is.finite(dvol_t_to_t1)]
+  n_pairs <- nrow(valid)
+
+  leverage_corr <- if (n_pairs >= 3L) {
+    cor(valid$ret_t, valid$dvol_t_to_t1)
+  } else {
+    NA_real_
+  }
+
+  leverage_pvalue <- if (n_pairs >= 4L) {
+    tryCatch(
+      cor.test(valid$ret_t, valid$dvol_t_to_t1)$p.value,
+      error = function(e) NA_real_
+    )
+  } else {
+    NA_real_
+  }
+
+  data.table(
+    sample_minutes = freq_mins,
+    n_pairs = n_pairs,
+    leverage_corr = leverage_corr,
+    leverage_pvalue = leverage_pvalue,
+    mean_ret_t = mean(valid$ret_t, na.rm = TRUE),
+    mean_dvol = mean(valid$dvol_t_to_t1, na.rm = TRUE)
+  )
+}), fill = TRUE)
+
+setorder(leverage_summary_all, sample_minutes)
+leverage_summary_all
+```
+
+```{r leverage-effects-plot}
+plot(
+  leverage_summary_all$sample_minutes,
+  leverage_summary_all$leverage_corr,
+  type = "b",
+  pch = 19,
+  col = "brown3",
+  xlab = "Sampling Frequency (minutes)",
+  ylab = "Corr(r_t, vol_{t+1} - vol_t)",
+  main = "Leverage Effect by Sampling Frequency"
+)
+abline(h = 0, lty = 2, col = "gray40")
+```
+
+# 6) Rejection Rate over Confidence and Sampling Frequency
+
+
+```{r rejection-summary}
+jump_summary_all
+```
+
+```{r}
+daily_details_all[confidence_level == 0.95 & sample_minutes == 30 & reject_null == TRUE]
+```
+
+```{r rejection-rate-by-frequency-plot}
+plot_confidence_levels <- sort(unique(jump_summary_all$confidence_level))
+old_par <- par(no.readonly = TRUE)
+on.exit(par(old_par))
+
+# par(mfrow = c(length(plot_alpha_levels), 1), mar = c(3.5, 4, 2.5, 1))
+
+for (c_q in plot_confidence_levels) {
+  panel <- jump_summary_all[confidence_level == c_q & sample_minutes >= 5][order(sample_minutes)]
+  y_max <- suppressWarnings(max(panel$rejection_rate, na.rm = TRUE))
+  if (!is.finite(y_max)) {
+    y_max <- 0.1
+  }
+  y_lim <- c(0, max(0.05, y_max * 1.10))
+
+  plot(
+    panel$sample_minutes,
+    panel$rejection_rate,
+    type = "b",
+    pch = 19,
+    col = "steelblue4",
+    ylim = y_lim,
+    xlab = "Sampling Frequency (minutes)",
+    ylab = "Rejection Rate",
+    main = paste0(
+      "Rejection Rate by Sampling Frequency (confidence level = ",
+      sprintf("%.3f", c_q),
+      ")"
+    )
+  )
+  abline(h = 0, lty = 2, col = "gray50")
+}
+```
+
+# 7) Figure Similar to Reference (Ratio Statistic vs Critical Value)
+
+```{r ratio-critical-plot}
+
+```
+
+
+```{r ratio-critical-plot}
+plot_confidence <- 0.95
+plot_freqs <- c(1L, 5L, 30L, 120L)
+
+plot_data <- daily_details_all[
+  sample_minutes %in% plot_freqs &
+    abs(confidence_level - plot_confidence) < 1e-10
+]
+
+plot_data <- plot_data[order(sample_minutes, DATE)]
+
+old_par <- par(no.readonly = TRUE)
+on.exit(par(old_par))
+
+# par(mfrow = c(2, 2), mar = c(3, 3, 2.5, 1), oma = c(1.2, 1.2, 0, 0))
+
+for (i in seq_along(plot_freqs)) {
+  freq <- plot_freqs[i]
+  panel <- plot_data[sample_minutes == freq]
+
+  if (nrow(panel) == 0) {
+    plot.new()
+    text(0.5, 0.5, paste0("No data at ", freq, "m"))
+    next
+  }
+
+  x <- seq_len(nrow(panel))
+  y_stat <- panel$ztest
+  y_stat_plot <- pmax(y_stat, 0)
+  y_cv <- panel$critical_upper
+
+  y_cv_max <- suppressWarnings(max(y_cv, na.rm = TRUE))
+  if (!is.finite(y_cv_max)) {
+    y_cv_max <- 1
+  }
+  y_upper <- y_cv_max * 3
+
+  plot(
+    x, y_stat_plot,
+    type = "n",
+    ylim = c(0, y_upper),
+    xlab = "",
+    ylab = "",
+    main = paste0("Sampling = ", freq, " min (conf = ", plot_confidence, ")"),
+    bty = "l"
+  )
+
+  # segments(
+  #   x0 = x,
+  #   y0 = 0,
+  #   x1 = x,
+  #   y1 = y_stat_plot,
+  #   col = "gray30",
+  #   lwd = 0.8
+  # )
+  points(x, y_stat_plot, pch = 3, col = "gray20", cex = 0.7)
+  lines(x, y_cv, col = "gray20", lwd = 1.2)
+  abline(h = 0, col = "gray20", lwd = 1.5)
+
+  if (i %% 2 == 1L) {
+    mtext("Statistic", side = 2, line = 2)
+  }
+  if (i > 2L) {
+    mtext("Days", side = 1, line = 2)
+  }
+  # if (i == 1L) {
+  #   legend(
+  #     "topright",
+  #     legend = c("Z-test statistic (positive part)", "Positive critical value"),
+  #     pch = c(3, NA),
+  #     lty = c(NA, 1),
+  #     col = c("gray20", "gray20"),
+  #     bty = "n",
+  #     cex = 0.9
+  #   )
+  # }
+}
+```
+
+# 8) Final Combined Table (Autocorrelation + Rejection Rate)
+
+```{r final-table}
+final_table <- merge(
+  jump_summary_all,
+  acf_summary_all,
+  by = "sample_minutes",
+  all.x = TRUE
+)
+
+setorder(final_table, sample_minutes, confidence_level)
+
+final_table[
+  ,
+  .(
+    sample_minutes,
+    confidence_level,
+    alpha_quantile,
+    n_returns,
+    lag1_acf,
+    lag1_to_lag5_acf_sum,
+    n_test_days,
+    reject_days,
+    rejection_rate
+  )
+]
+```
+
+# 9) Period-Based Rejection and Largest-Ztest Day (30m, 95%)
+
+```{r period-controls}
+# Fixed context requested:
+fixed_confidence_level <- 0.95
+fixed_sample_minutes <- 30L
+
+# User control: choose "month", "quarter", or "all".
+period_unit <- "month"
+
+# Optional plotting controls:
+# - plot_sample_minutes controls only section-9 visualization frequency.
+#   (Temporarily set to 1-minute as requested.)
+plot_sample_minutes <- 1L
+#
+# - If NULL, uses the first available period.
+# - If visualized_day is NULL, uses the max-ztest day in selected period.
+period_to_plot <- NULL
+visualized_day <- NULL
+
+daily_tests <- daily_details_all[
+  abs(confidence_level - fixed_confidence_level) < 1e-10 &
+    sample_minutes == fixed_sample_minutes
+]
+
+if (nrow(daily_tests) == 0) {
+  stop(
+    "No daily tests found for confidence_level = ",
+    fixed_confidence_level,
+    " and sample_minutes = ",
+    fixed_sample_minutes
+  )
+}
+
+add_period_columns <- function(dt, unit = c("month", "quarter", "all")) {
+  unit <- match.arg(unit)
+  out <- copy(dt)
+
+  if (unit == "month") {
+    out[, period_id := format(DATE, "%Y-%m")]
+    out[, period_start := as.Date(format(DATE, "%Y-%m-01"))]
+  } else if (unit == "quarter") {
+    out[, period_year := as.integer(format(DATE, "%Y"))]
+    out[, period_quarter := (as.integer(format(DATE, "%m")) - 1L) %/% 3L + 1L]
+    out[, period_id := sprintf("%d-Q%d", period_year, period_quarter)]
+    out[, period_start := as.Date(
+      sprintf("%d-%02d-01", period_year, (period_quarter - 1L) * 3L + 1L)
+    )]
+  } else {
+    out[, period_id := "ALL"]
+    out[, period_start := min(DATE, na.rm = TRUE)]
+  }
+
+  out[, period_end := max(DATE), by = .(period_id, period_start)]
+  setorder(out, period_start, DATE)
+  out
+}
+
+periodized_daily_tests <- add_period_columns(daily_tests, unit = period_unit)
+
+cat("Fixed confidence level:", fixed_confidence_level, "\n")
+cat("Fixed sample frequency:", fixed_sample_minutes, "minutes\n")
+cat("Period grouping:", period_unit, "\n")
+cat("Plot sampling frequency:", plot_sample_minutes, "minutes\n")
+```
+
+```{r rejection-rate-by-period-table}
+rejection_rate_by_period <- periodized_daily_tests[
+  ,
+  .(
+    period_start = min(DATE),
+    period_end = max(DATE),
+    n_test_days = .N,
+    reject_days = sum(reject_null, na.rm = TRUE),
+    rejection_rate = mean(reject_null, na.rm = TRUE)
+  ),
+  by = period_id
+]
+
+setorder(rejection_rate_by_period, period_start)
+rejection_rate_by_period[]
+```
+
+```{r rejection-vs-daily-realized-volatility}
+# Daily realized variance/volatility at the same test sampling frequency.
+daily_rv_sampled <- resample_prices(
+  pData,
+  freq_mins = fixed_sample_minutes,
+  tz = "UTC"
+)
+
+daily_rv_xts <- rCov(
+  xts(daily_rv_sampled$PRICE, order.by = daily_rv_sampled$DT, tzone = "UTC"),
+  makeReturns = TRUE
+)
+
+daily_rv_tbl <- data.table(
+  DATE = as.Date(zoo::index(daily_rv_xts), tz = "UTC"),
+  daily_rv = to_numeric_xts(daily_rv_xts)
+)
+daily_rv_tbl[, daily_vol := sqrt(pmax(daily_rv, 0))]
+
+daily_reject_vs_rv <- merge(
+  periodized_daily_tests[
+    ,
+    .(DATE, period_id, period_start, period_end, reject_null, ztest, pvalue)
+  ],
+  daily_rv_tbl,
+  by = "DATE",
+  all.x = TRUE
+)
+
+daily_reject_vs_rv <- daily_reject_vs_rv[
+  is.finite(daily_rv) & is.finite(daily_vol) & !is.na(reject_null)
+]
+daily_reject_vs_rv[, reject_flag := as.integer(reject_null)]
+
+daily_corr_test <- if (
+  nrow(daily_reject_vs_rv) >= 3L &&
+    length(unique(daily_reject_vs_rv$reject_flag)) > 1L
+) {
+  tryCatch(
+    cor.test(daily_reject_vs_rv$reject_flag, daily_reject_vs_rv$daily_vol),
+    error = function(e) NULL
+  )
+} else {
+  NULL
+}
+
+daily_reject_rv_correlation <- data.table(
+  n_days = nrow(daily_reject_vs_rv),
+  reject_days = sum(daily_reject_vs_rv$reject_null, na.rm = TRUE),
+  mean_daily_vol_reject = daily_reject_vs_rv[
+    reject_null == TRUE,
+    mean(daily_vol, na.rm = TRUE)
+  ],
+  mean_daily_vol_non_reject = daily_reject_vs_rv[
+    reject_null == FALSE,
+    mean(daily_vol, na.rm = TRUE)
+  ],
+  corr_reject_vs_daily_vol = if (is.null(daily_corr_test)) {
+    NA_real_
+  } else {
+    as.numeric(daily_corr_test$estimate)
+  },
+  corr_pvalue = if (is.null(daily_corr_test)) {
+    NA_real_
+  } else {
+    daily_corr_test$p.value
+  }
+)
+
+daily_reject_rv_correlation[]
+```
+
+```{r rejection-vs-daily-realized-volatility-plot, fig.width=8, fig.height=4}
+if (nrow(daily_reject_vs_rv) == 0L) {
+  stop("No rows available for reject-vs-daily-volatility visualization.")
+}
+
+boxplot(
+  daily_vol ~ reject_null,
+  data = daily_reject_vs_rv,
+  names = c("No reject", "Reject"),
+  col = c("#9ECAE1", "#FC9272"),
+  xlab = "Reject null?",
+  ylab = "Daily realized volatility (sqrt(RV))",
+  main = paste0(
+    "Daily Rejection vs Realized Volatility (",
+    fixed_sample_minutes, "-minute sampling)"
+  )
+)
+```
+
+```{r rejection-rate-vs-period-realized-volatility}
+period_vol_table <- daily_reject_vs_rv[
+  ,
+  .(
+    period_start = min(DATE),
+    period_end = max(DATE),
+    n_days = .N,
+    reject_days = sum(reject_null, na.rm = TRUE),
+    rejection_rate = mean(reject_null, na.rm = TRUE),
+    period_rv_sum = sum(pmax(daily_rv, 0), na.rm = TRUE),
+    period_realized_vol = sqrt(sum(pmax(daily_rv, 0), na.rm = TRUE)),
+    mean_daily_vol = mean(daily_vol, na.rm = TRUE)
+  ),
+  by = period_id
+]
+setorder(period_vol_table, period_start)
+
+period_corr_test <- if (
+  nrow(period_vol_table) >= 3L &&
+    length(unique(period_vol_table$rejection_rate)) > 1L &&
+    length(unique(period_vol_table$period_realized_vol)) > 1L
+) {
+  tryCatch(
+    cor.test(period_vol_table$rejection_rate, period_vol_table$period_realized_vol),
+    error = function(e) NULL
+  )
+} else {
+  NULL
+}
+
+period_reject_rv_correlation <- data.table(
+  n_periods = nrow(period_vol_table),
+  corr_rejection_rate_vs_period_realized_vol = if (is.null(period_corr_test)) {
+    NA_real_
+  } else {
+    as.numeric(period_corr_test$estimate)
+  },
+  corr_pvalue = if (is.null(period_corr_test)) {
+    NA_real_
+  } else {
+    period_corr_test$p.value
+  }
+)
+
+period_reject_rv_correlation[]
+period_vol_table[]
+```
+
+```{r highest-vs-lowest-rejection-period-price-plot, fig.width=11, fig.height=7}
+period_ranked <- period_vol_table[is.finite(rejection_rate)][order(-rejection_rate, period_start)]
+if (nrow(period_ranked) == 0L) {
+  stop("No finite period rejection rates are available for comparison.")
+}
+
+highest_reject_period <- period_ranked[1]
+lowest_reject_period <- period_ranked[.N]
+selected_period_ids <- unique(c(highest_reject_period$period_id, lowest_reject_period$period_id))
+
+period_price_sampled <- resample_prices(
+  pData,
+  freq_mins = plot_sample_minutes,
+  tz = "UTC"
+)
+period_price_sampled[, DATE := as.Date(DT, tz = "UTC")]
+period_price_sampled <- add_period_columns(period_price_sampled, unit = period_unit)
+
+high_period_prices <- period_price_sampled[period_id == highest_reject_period$period_id]
+low_period_prices <- period_price_sampled[period_id == lowest_reject_period$period_id]
+
+op <- par(no.readonly = TRUE)
+par(mfrow = c(2, 1), mar = c(5, 4, 4, 1))
+
+plot(
+  high_period_prices$DT,
+  high_period_prices$PRICE,
+  type = "l",
+  col = "#D95F02",
+  lwd = 1.2,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(
+    "Highest Rejection Period: ", highest_reject_period$period_id,
+    " (rate=", sprintf("%.3f", highest_reject_period$rejection_rate), ")"
+  )
+)
+
+plot(
+  low_period_prices$DT,
+  low_period_prices$PRICE,
+  type = "l",
+  col = "#1B9E77",
+  lwd = 1.2,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(
+    "Lowest Rejection Period: ", lowest_reject_period$period_id,
+    " (rate=", sprintf("%.3f", lowest_reject_period$rejection_rate), ")"
+  )
+)
+
+par(op)
+
+period_vol_table[
+  period_id %in% selected_period_ids,
+  .(
+    period_id,
+    period_start,
+    period_end,
+    n_days,
+    reject_days,
+    rejection_rate,
+    period_realized_vol,
+    mean_daily_vol
+  )
+][order(-rejection_rate, period_start)]
+```
+
+```{r microstructure-noise-diagnostics-extreme-periods}
+diagnostic_period_bounds <- unique(
+  period_vol_table[
+    period_id %in% selected_period_ids,
+    .(period_id, period_start, period_end)
+  ]
+)
+
+microstructure_period_extremes <- rbindlist(lapply(seq_len(nrow(diagnostic_period_bounds)), function(i) {
+  pid <- diagnostic_period_bounds$period_id[i]
+  pstart <- diagnostic_period_bounds$period_start[i]
+  pend <- diagnostic_period_bounds$period_end[i]
+
+  period_start_dt <- as.POSIXct(
+    paste(as.character(pstart), "00:00:00"),
+    tz = "UTC"
+  )
+  period_end_dt <- as.POSIXct(
+    paste(as.character(pend), "23:59:59"),
+    tz = "UTC"
+  )
+
+  p_period <- pData[DT >= period_start_dt & DT <= period_end_dt]
+  if (nrow(p_period) < 50L) {
+    return(NULL)
+  }
+
+  rbindlist(lapply(sample_freq_grid, function(freq_mins) {
+    sampled <- resample_prices(p_period, freq_mins = freq_mins, tz = "UTC")
+    sampled[, ret := log(PRICE) - shift(log(PRICE), type = "lag")]
+    ret_vec <- sampled[is.finite(ret), ret]
+
+    if (length(ret_vec) < 20L) {
+      return(data.table(
+        period_id = pid,
+        period_start = pstart,
+        period_end = pend,
+        sample_minutes = freq_mins,
+        n_intraday_returns = length(ret_vec),
+        lag1_return_acf = NA_real_,
+        lag1_to_lag5_acf_sum = NA_real_,
+        ljung_box_pvalue_lag10 = NA_real_,
+        mean_daily_rv = NA_real_,
+        mean_daily_bp = NA_real_,
+        mean_daily_rk = NA_real_,
+        mean_daily_ts = NA_real_,
+        mean_daily_rts = NA_real_,
+        rv_minus_rk = NA_real_,
+        rv_minus_rts = NA_real_
+      ))
+    }
+
+    lag1_acf <- suppressWarnings(cor(ret_vec[-1], ret_vec[-length(ret_vec)]))
+    lag1_to_lag5_acf_sum <- if (length(ret_vec) >= 6L) {
+      acf_obj <- stats::acf(ret_vec, plot = FALSE, lag.max = 5L, na.action = na.pass)
+      sum(as.numeric(acf_obj$acf[2:6]), na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+    ljung_p <- if (length(ret_vec) > 20L) {
+      Box.test(ret_vec, lag = 10L, type = "Ljung-Box")$p.value
+    } else {
+      NA_real_
+    }
+
+    px_xts <- xts(sampled$PRICE, order.by = sampled$DT, tzone = "UTC")
+    rv_xts <- rCov(px_xts, makeReturns = TRUE)
+    bp_xts <- rBPCov(px_xts, makeReturns = TRUE)
+    rk_xts <- suppressWarnings(rKernelCov(px_xts, makeReturns = TRUE))
+
+    rv_vec <- to_numeric_xts(rv_xts)
+    bp_vec <- to_numeric_xts(bp_xts)
+    rk_vec <- to_numeric_xts(rk_xts)
+    rk_vec[rk_vec < 0] <- NA_real_
+
+    ts_tbl <- daywise_noise_robust(sampled, estimator = "rTSCov", tz = "UTC")
+    rts_tbl <- daywise_noise_robust(sampled, estimator = "rRTSCov", tz = "UTC")
+
+    data.table(
+      period_id = pid,
+      period_start = pstart,
+      period_end = pend,
+      sample_minutes = freq_mins,
+      n_intraday_returns = length(ret_vec),
+      lag1_return_acf = lag1_acf,
+      lag1_to_lag5_acf_sum = lag1_to_lag5_acf_sum,
+      ljung_box_pvalue_lag10 = ljung_p,
+      mean_daily_rv = mean(rv_vec, na.rm = TRUE),
+      mean_daily_bp = mean(bp_vec, na.rm = TRUE),
+      mean_daily_rk = mean(rk_vec, na.rm = TRUE),
+      mean_daily_ts = mean(ts_tbl$value, na.rm = TRUE),
+      mean_daily_rts = mean(rts_tbl$value, na.rm = TRUE),
+      rv_minus_rk = mean(rv_vec - rk_vec, na.rm = TRUE),
+      rv_minus_rts = mean(rv_vec - rts_tbl$value, na.rm = TRUE)
+    )
+  }), fill = TRUE)
+}), fill = TRUE)
+
+setorder(microstructure_period_extremes, period_id, sample_minutes)
+microstructure_period_extremes[]
+```
+
+```{r microstructure-noise-diagnostics-extreme-periods-plots, fig.width=11, fig.height=12}
+if (nrow(microstructure_period_extremes) == 0L) {
+  stop("No microstructure diagnostics available for selected periods.")
+}
+
+plot_tbl <- microstructure_period_extremes[is.finite(sample_minutes)]
+period_ids_plot <- unique(plot_tbl$period_id)
+palette_cols <- c("#D95F02", "#1B9E77", "#7570B3", "#E7298A")
+period_colors <- setNames(
+  palette_cols[seq_len(length(period_ids_plot))],
+  period_ids_plot
+)
+
+plot_metric_by_period <- function(metric_col, ylab_txt, main_txt) {
+  y_values <- plot_tbl[[metric_col]]
+  y_finite <- y_values[is.finite(y_values)]
+  y_lim <- if (length(y_finite) == 0L) {
+    c(0, 1)
+  } else {
+    range(y_finite)
+  }
+  if (abs(y_lim[2] - y_lim[1]) < .Machine$double.eps) {
+    y_lim <- y_lim + c(-0.1, 0.1)
+  }
+
+  plot(
+    NA,
+    xlim = range(sample_freq_grid),
+    ylim = y_lim,
+    xlab = "Sampling Frequency (minutes)",
+    ylab = ylab_txt,
+    main = main_txt
+  )
+
+  for (pid in period_ids_plot) {
+    sub <- plot_tbl[period_id == pid]
+    sub <- sub[is.finite(sub[[metric_col]])]
+    if (nrow(sub) > 0L) {
+      lines(
+        sub$sample_minutes,
+        sub[[metric_col]],
+        type = "b",
+        pch = 19,
+        col = period_colors[[pid]]
+      )
+    }
+  }
+
+  legend(
+    "topright",
+    legend = period_ids_plot,
+    col = unname(period_colors[period_ids_plot]),
+    pch = 19,
+    lty = 1,
+    bty = "n"
+  )
+}
+
+op <- par(no.readonly = TRUE)
+par(mfrow = c(4, 1), mar = c(4, 4, 3.2, 1))
+
+plot_metric_by_period(
+  metric_col = "mean_daily_rv",
+  ylab_txt = "Mean Daily RV",
+  main_txt = "Volatility Signature: Highest vs Lowest Rejection Period"
+)
+
+plot_metric_by_period(
+  metric_col = "lag1_return_acf",
+  ylab_txt = "Lag-1 Return ACF",
+  main_txt = "Lag-1 ACF: Highest vs Lowest Rejection Period"
+)
+abline(h = 0, lty = 2, col = "gray40")
+
+plot_metric_by_period(
+  metric_col = "lag1_to_lag5_acf_sum",
+  ylab_txt = "Sum ACF (Lags 1-5)",
+  main_txt = "Sum of Return ACF Lags 1-5: Highest vs Lowest Rejection Period"
+)
+abline(h = 0, lty = 2, col = "gray40")
+
+plot_metric_by_period(
+  metric_col = "rv_minus_rk",
+  ylab_txt = "Mean(RV - RK)",
+  main_txt = "Noise Gap (RV - RK): Highest vs Lowest Rejection Period"
+)
+abline(h = 0, lty = 2, col = "gray40")
+
+par(op)
+```
+
+```{r microstructure-noise-diagnosis-gap-table}
+if (length(selected_period_ids) >= 2L) {
+  high_id <- highest_reject_period$period_id
+  low_id <- lowest_reject_period$period_id
+
+  high_tbl <- microstructure_period_extremes[
+    period_id == high_id,
+    .(
+      sample_minutes,
+      high_lag1_return_acf = lag1_return_acf,
+      high_lag1_to_lag5_acf_sum = lag1_to_lag5_acf_sum,
+      high_rv_minus_rk = rv_minus_rk,
+      high_mean_daily_rv = mean_daily_rv
+    )
+  ]
+  low_tbl <- microstructure_period_extremes[
+    period_id == low_id,
+    .(
+      sample_minutes,
+      low_lag1_return_acf = lag1_return_acf,
+      low_lag1_to_lag5_acf_sum = lag1_to_lag5_acf_sum,
+      low_rv_minus_rk = rv_minus_rk,
+      low_mean_daily_rv = mean_daily_rv
+    )
+  ]
+
+  microstructure_noise_gap <- merge(
+    high_tbl,
+    low_tbl,
+    by = "sample_minutes",
+    all = TRUE
+  )
+  setorder(microstructure_noise_gap, sample_minutes)
+  microstructure_noise_gap[, `:=`(
+    lag1_acf_gap_high_minus_low = high_lag1_return_acf - low_lag1_return_acf,
+    lag1_to_lag5_acf_sum_gap_high_minus_low = high_lag1_to_lag5_acf_sum - low_lag1_to_lag5_acf_sum,
+    rv_minus_rk_gap_high_minus_low = high_rv_minus_rk - low_rv_minus_rk,
+    mean_daily_rv_gap_high_minus_low = high_mean_daily_rv - low_mean_daily_rv
+  )]
+
+  microstructure_noise_gap[]
+} else {
+  data.table(message = "Only one unique period found; two-period gap table is unavailable.")
+}
+```
+
+```{r rejection-rate-by-period-plot, fig.width=10, fig.height=4}
+plot_data <- rejection_rate_by_period[is.finite(rejection_rate)]
+
+if (nrow(plot_data) == 0L) {
+  stop("No finite rejection rates are available for plotting.")
+}
+
+plot(
+  x = seq_len(nrow(plot_data)),
+  y = plot_data$rejection_rate,
+  type = "b",
+  pch = 16,
+  col = "#2C7FB8",
+  ylim = c(0, 1),
+  xaxt = "n",
+  xlab = paste0("Period (", period_unit, ")"),
+  ylab = "Rejection rate",
+  main = "Rejection Rate by Period"
+)
+axis(1, at = seq_len(nrow(plot_data)), labels = plot_data$period_id, las = 2, cex.axis = 0.8)
+abline(h = seq(0, 1, by = 0.1), col = "grey90", lty = "dotted")
+```
+
+```{r largest-ztest-day-by-period}
+largest_ztest_by_period <- periodized_daily_tests[
+  is.finite(ztest),
+  .SD[which.max(ztest)],
+  by = period_id
+][
+  ,
+  .(
+    period_id,
+    period_start,
+    period_end,
+    DATE,
+    ztest,
+    pvalue,
+    reject_null
+  )
+]
+
+setorder(largest_ztest_by_period, period_start, DATE)
+largest_ztest_by_period[]
+```
+
+```{r top-k-largest-ztest-days}
+top_k_days <- 10L
+
+top_k_ztest_days <- daily_tests[
+  is.finite(ztest),
+  .(DATE, ztest, pvalue, reject_null)
+][order(-ztest, DATE)]
+
+top_k_ztest_days <- head(top_k_ztest_days, top_k_days)
+top_k_ztest_days <- merge(
+  top_k_ztest_days,
+  unique(periodized_daily_tests[, .(DATE, period_id, period_start, period_end)]),
+  by = "DATE",
+  all.x = TRUE
+)
+setcolorder(
+  top_k_ztest_days,
+  c("period_id", "period_start", "period_end", "DATE", "ztest", "pvalue", "reject_null")
+)
+setorder(top_k_ztest_days, -ztest, DATE)
+top_k_ztest_days[]
+```
+
+```{r period-day-price-plot}
+visualized_day <- as.Date("2026-01-19")
+
+if (nrow(largest_ztest_by_period) == 0) {
+  stop("No finite ztest value is available for plotting.")
+}
+
+if (is.null(period_to_plot)) {
+  period_to_plot <- largest_ztest_by_period$period_id[1]
+}
+if (!(period_to_plot %in% largest_ztest_by_period$period_id)) {
+  stop("period_to_plot not found in available periods: ", period_to_plot)
+}
+
+if (is.null(visualized_day)) {
+  day_to_plot <- largest_ztest_by_period[period_id == period_to_plot, DATE][1]
+} else {
+  day_to_plot <- as.Date(visualized_day)
+}
+
+plot_price_data <- resample_prices(
+  pData,
+  freq_mins = plot_sample_minutes,
+  tz = "UTC"
+)
+
+plot_prices <- plot_price_data[as.Date(DT, tz = "UTC") == day_to_plot]
+if (nrow(plot_prices) == 0) {
+  stop("No price data found for selected day: ", as.character(day_to_plot))
+}
+
+day_test <- periodized_daily_tests[DATE == day_to_plot][1]
+
+plot(
+  plot_prices$DT,
+  plot_prices$PRICE,
+  type = "l",
+  col = "black",
+  lwd = 1.2,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(
+    "BTC Prices on ", day_to_plot,
+    " (", plot_sample_minutes, "-minute sampling, ",
+    ", z=",
+    sprintf("%.2f", day_test$ztest), ")"
+  )
+)
+
+legend(
+  "topleft",
+  legend = "Price",
+  col = "black",
+  lty = 1,
+  bty = "n"
+)
+```
+
+```{r period-day-price-zoom-plot}
+# Optional zoom window (UTC) within the selected day_to_plot
+zoom_start_time <- "01:30:00"
+zoom_end_time <- "02:30:00"
+
+zoom_start_dt <- as.POSIXct(
+  paste(as.character(day_to_plot), zoom_start_time),
+  tz = "UTC"
+)
+zoom_end_dt <- as.POSIXct(
+  paste(as.character(day_to_plot), zoom_end_time),
+  tz = "UTC"
+)
+
+plot_prices_zoom <- plot_price_data[DT >= zoom_start_dt & DT <= zoom_end_dt]
+if (nrow(plot_prices_zoom) == 0) {
+  stop(
+    "No price data in selected zoom window: ",
+    format(zoom_start_dt, "%Y-%m-%d %H:%M:%S"),
+    " to ",
+    format(zoom_end_dt, "%Y-%m-%d %H:%M:%S"),
+    " (UTC)"
+  )
+}
+
+plot(
+  plot_prices_zoom$DT,
+  plot_prices_zoom$PRICE,
+  type = "l",
+  col = "black",
+  lwd = 1.2,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(
+    "Zoomed BTC Prices on ", day_to_plot, " (",
+    zoom_start_time, " - ", zoom_end_time, " UTC)"
+  )
+)
+
+legend(
+  "topleft",
+  legend = "Price",
+  col = "black",
+  lty = 1,
+  bty = "n"
+)
+```
+
+# 10) Intraday Jump Test for a Specific Day (with Previous-Day Warmup)
+
+```{r intraday-specific-day-controls}
+# Keep these settings consistent with btc_jump_tests.Rmd::intraday-jump-test
+intraday_lookback_period <- 90L
+intraday_align_by <- "minutes" 
+intraday_align_period <- 1L * 5
+intraday_market_open <- "00:00:00"
+intraday_market_close <- "23:59:59"
+intraday_tz <- "UTC"
+
+# Choose the day to test. If NULL, fallback to day_to_plot from section 9.
+intraday_test_day <- as.Date("2025-12-26")
+
+# Include the previous day so rolling volatility estimates at the start of
+# intraday_test_day have warmup observations.
+intraday_warmup_days <- 30L
+
+if (is.null(intraday_test_day)) {
+  intraday_test_day <- as.Date(day_to_plot)
+}
+intraday_test_day <- as.Date(intraday_test_day)
+
+intraday_window_start <- intraday_test_day - intraday_warmup_days
+intraday_window_end <- intraday_test_day
+
+intraday_start_dt <- as.POSIXct(
+  paste(as.character(intraday_window_start), "00:00:00"),
+  tz = intraday_tz
+)
+intraday_end_dt <- as.POSIXct(
+  paste(as.character(intraday_window_end), "23:59:59"),
+  tz = intraday_tz
+)
+
+pData_intraday_test <- pData[
+  DT >= intraday_start_dt & DT <= intraday_end_dt
+]
+
+if (nrow(pData_intraday_test) == 0) {
+  stop(
+    "No data found in intraday test window: ",
+    format(intraday_start_dt, "%Y-%m-%d %H:%M:%S"),
+    " to ",
+    format(intraday_end_dt, "%Y-%m-%d %H:%M:%S"),
+    " (UTC)"
+  )
+}
+
+cat("Intraday target day:", as.character(intraday_test_day), "\n")
+cat("Warmup days included:", intraday_warmup_days, "\n")
+cat(
+  "Intraday estimation window:",
+  format(intraday_start_dt, "%Y-%m-%d %H:%M:%S"),
+  "to",
+  format(intraday_end_dt, "%Y-%m-%d %H:%M:%S"),
+  "UTC\n"
+)
+cat("Rows in intraday test window:", nrow(pData_intraday_test), "\n")
+```
+
+```{r intraday-specific-day-test}
+intraday_specific <- intradayJumpTest(
+  pData = pData_intraday_test,
+  alignBy = intraday_align_by,
+  alignPeriod = intraday_align_period,
+  marketOpen = intraday_market_open,
+  marketClose = intraday_market_close,
+  tz = intraday_tz,
+)
+
+if (!inherits(intraday_specific, "intradayJumpTest")) {
+  stop("Expected intraday_specific to be class intradayJumpTest.")
+}
+if (!xts::is.xts(intraday_specific$ztest)) {
+  stop("Expected intraday_specific$ztest to be xts.")
+}
+
+intraday_critical <- intraday_specific$criticalValue
+if (is.null(intraday_critical)) {
+  intraday_critical <- intraday_specific$critical.value
+}
+intraday_critical <- as.numeric(intraday_critical)[1]
+
+intraday_specific_df <- data.table(
+  DT = as.POSIXct(zoo::index(intraday_specific$ztest), tz = intraday_tz),
+  ztest = as.numeric(intraday_specific$ztest)
+)
+intraday_specific_df[, criticalValue := intraday_critical]
+intraday_specific_df[, jump_flag := !is.na(ztest) & is.finite(ztest) & (abs(ztest) > criticalValue)]
+intraday_specific_df[, DATE := as.Date(DT, tz = intraday_tz)]
+
+intraday_specific_day <- intraday_specific_df[DATE == intraday_test_day]
+intraday_specific_jumps <- intraday_specific_day[jump_flag == TRUE]
+
+cat("Intraday rows on target day:", nrow(intraday_specific_day), "\n")
+cat("Detected intraday jumps on target day:", nrow(intraday_specific_jumps), "\n")
+
+intraday_specific_jumps
+```
+
+```{r}
+plot(intraday_specific$ztest)
+```
+
+```{r intraday-specific-day-plot}
+intraday_plot_data <- resample_prices(
+  pData_intraday_test,
+  freq_mins = intraday_align_period,
+  tz = intraday_tz
+)[as.Date(DT, tz = intraday_tz) == intraday_test_day]
+
+if (nrow(intraday_plot_data) == 0) {
+  stop("No intraday plot data found for target day: ", as.character(intraday_test_day))
+}
+
+jump_plot_data <- merge(
+  intraday_plot_data,
+  intraday_specific_jumps[, .(DT, ztest)],
+  by = "DT",
+  all = FALSE
+)
+
+plot(
+  intraday_plot_data$DT,
+  intraday_plot_data$PRICE,
+  type = "l",
+  col = "black",
+  lwd = 1.2,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(
+    "Intraday Test on ", intraday_test_day,
+    " (", intraday_align_period, "-minute, lookBack=", intraday_lookback_period,
+    ", warmup days=", intraday_warmup_days, ")"
+  )
+)
+
+if (nrow(jump_plot_data) > 0) {
+  points(
+    jump_plot_data$DT,
+    jump_plot_data$PRICE,
+    pch = 19,
+    col = "red",
+    cex = 0.9
+  )
+  text(
+    jump_plot_data$DT,
+    jump_plot_data$PRICE,
+    labels = sprintf("z=%.2f", jump_plot_data$ztest),
+    pos = 4,
+    cex = 0.7,
+    col = "red"
+  )
+}
+
+legend(
+  "topleft",
+  legend = c("Price", "Detected intraday jump"),
+  col = c("black", "red"),
+  lty = c(1, NA),
+  pch = c(NA, 19),
+  bty = "n"
+)
+```
+
+```{r intraday-specific-day-zoom-plot}
+# Optional zoom window (UTC) within intraday_test_day
+intraday_zoom_start_time <- "07:00:00"
+intraday_zoom_end_time <- "09:00:00"
+
+intraday_zoom_start_dt <- as.POSIXct(
+  paste(as.character(intraday_test_day), intraday_zoom_start_time),
+  tz = intraday_tz
+)
+intraday_zoom_end_dt <- as.POSIXct(
+  paste(as.character(intraday_test_day), intraday_zoom_end_time),
+  tz = intraday_tz
+)
+
+intraday_plot_data_zoom <- intraday_plot_data[
+  DT >= intraday_zoom_start_dt & DT <= intraday_zoom_end_dt
+]
+if (nrow(intraday_plot_data_zoom) == 0) {
+  stop(
+    "No intraday data in selected zoom window: ",
+    format(intraday_zoom_start_dt, "%Y-%m-%d %H:%M:%S"),
+    " to ",
+    format(intraday_zoom_end_dt, "%Y-%m-%d %H:%M:%S"),
+    " (UTC)"
+  )
+}
+
+intraday_specific_jumps_zoom <- intraday_specific_jumps[
+  DT >= intraday_zoom_start_dt & DT <= intraday_zoom_end_dt,
+  .(DT, ztest)
+]
+jump_plot_data_zoom <- merge(
+  intraday_plot_data_zoom,
+  intraday_specific_jumps_zoom,
+  by = "DT",
+  all = FALSE
+)
+
+plot(
+  intraday_plot_data_zoom$DT,
+  intraday_plot_data_zoom$PRICE,
+  type = "l",
+  col = "black",
+  lwd = 1.2,
+  xlab = "Time (UTC)",
+  ylab = "Price",
+  main = paste0(
+    "Zoomed Intraday Prices on ", intraday_test_day, " (",
+    intraday_zoom_start_time, " - ", intraday_zoom_end_time, " UTC)"
+  )
+)
+
+if (nrow(jump_plot_data_zoom) > 0) {
+  points(
+    jump_plot_data_zoom$DT,
+    jump_plot_data_zoom$PRICE,
+    pch = 19,
+    col = "red",
+    cex = 0.9
+  )
+  text(
+    jump_plot_data_zoom$DT,
+    jump_plot_data_zoom$PRICE,
+    labels = sprintf("z=%.2f", jump_plot_data_zoom$ztest),
+    pos = 4,
+    cex = 0.7,
+    col = "red"
+  )
+}
+
+legend(
+  "topleft",
+  legend = c("Price", "Detected intraday jump"),
+  col = c("black", "red"),
+  lty = c(1, NA),
+  pch = c(NA, 19),
+  bty = "n"
+)
+```
+
+# 11) April vs May Jump Dynamic Changes
+
+```{r april-may-target-periods}
+if (!exists("daily_tests") || nrow(daily_tests) == 0L) {
+  stop("Section 11 needs `daily_tests` from section 9.")
+}
+
+monthly_daily_tests <- copy(daily_tests)
+monthly_daily_tests[, period_id := format(DATE, "%Y-%m")]
+monthly_daily_tests[, month_num := as.integer(format(DATE, "%m"))]
+
+monthly_rejection_rank <- monthly_daily_tests[
+  ,
+  .(
+    period_start = min(DATE),
+    period_end = max(DATE),
+    n_days = .N,
+    reject_days = sum(reject_null, na.rm = TRUE),
+    rejection_rate = mean(reject_null, na.rm = TRUE),
+    mean_ztest = mean(ztest, na.rm = TRUE),
+    mean_abs_ztest = mean(abs(ztest), na.rm = TRUE),
+    median_pvalue = median(pvalue, na.rm = TRUE)
+  ),
+  by = .(period_id, month_num)
+]
+setorder(monthly_rejection_rank, period_start)
+monthly_rejection_rank[, global_rank_high_to_low := rank(-rejection_rate, ties.method = "min")]
+monthly_rejection_rank[, global_rank_low_to_high := rank(rejection_rate, ties.method = "min")]
+
+april_period_id <- monthly_rejection_rank[
+  month_num == 4L
+][order(-rejection_rate, period_start), period_id][1]
+may_period_id <- monthly_rejection_rank[
+  month_num == 5L
+][order(rejection_rate, period_start), period_id][1]
+
+if (is.na(april_period_id) || is.na(may_period_id)) {
+  stop("Could not locate both April and May periods in the current sample.")
+}
+
+april_may_period_ids <- c(april_period_id, may_period_id)
+april_may_monthly_context <- monthly_rejection_rank[period_id %in% april_may_period_ids]
+april_may_monthly_context[, role := ifelse(
+  period_id == april_period_id,
+  "April reference (highest among Aprils)",
+  "May reference (lowest among Mays)"
+)]
+setorder(april_may_monthly_context, -rejection_rate, period_start)
+
+monthly_rejection_rank[]
+april_may_monthly_context[]
+```
+
+```{r april-may-jump-mechanism}
+april_may_sampled_prices <- resample_prices(
+  pData,
+  freq_mins = fixed_sample_minutes,
+  tz = "UTC"
+)
+april_may_sampled_prices[, DATE := as.Date(DT, tz = "UTC")]
+april_may_sampled_prices[, period_id := format(DATE, "%Y-%m")]
+april_may_sampled_prices <- april_may_sampled_prices[period_id %in% april_may_period_ids]
+
+if (nrow(april_may_sampled_prices) == 0L) {
+  stop("No sampled prices for selected April/May periods.")
+}
+
+april_may_daily_hf <- rbindlist(lapply(april_may_period_ids, function(pid) {
+  px_period <- april_may_sampled_prices[period_id == pid]
+  px_xts <- xts(px_period$PRICE, order.by = px_period$DT, tzone = "UTC")
+
+  rv_xts <- rCov(px_xts, makeReturns = TRUE)
+  bp_xts <- rBPCov(px_xts, makeReturns = TRUE)
+  medrv_xts <- rMedRVar(px_xts, makeReturns = TRUE)
+  minrv_xts <- rMinRVar(px_xts, makeReturns = TRUE)
+  quar_xts <- rQuar(px_xts, makeReturns = TRUE)
+  tpquar_xts <- rTPQuar(px_xts, makeReturns = TRUE)
+
+  out <- data.table(
+    DATE = as.Date(zoo::index(rv_xts), tz = "UTC"),
+    period_id = pid,
+    rv = to_numeric_xts(rv_xts),
+    bpv = to_numeric_xts(bp_xts),
+    medrv = to_numeric_xts(medrv_xts),
+    minrv = to_numeric_xts(minrv_xts),
+    quar = to_numeric_xts(quar_xts),
+    tpquar = to_numeric_xts(tpquar_xts)
+  )
+
+  out[, jump_gap := pmax(rv - bpv, 0)]
+  out[, jump_share_rv := ifelse(rv > 0, jump_gap / rv, NA_real_)]
+  out[, bpv_share_rv := ifelse(rv > 0, bpv / rv, NA_real_)]
+  out[, jump_signal_scaled := jump_gap / sqrt(pmax(tpquar, .Machine$double.eps))]
+  out
+}), fill = TRUE)
+
+april_may_daily_returns <- copy(april_may_sampled_prices)
+april_may_daily_returns[, ret := log(PRICE) - shift(log(PRICE), type = "lag"), by = .(period_id, DATE)]
+april_may_daily_tail <- april_may_daily_returns[is.finite(ret), .(
+  max_abs_ret = max(abs(ret), na.rm = TRUE),
+  q99_abs_ret = as.numeric(quantile(abs(ret), 0.99, na.rm = TRUE))
+), by = .(period_id, DATE)]
+
+april_may_daily_features <- merge(
+  monthly_daily_tests[period_id %in% april_may_period_ids, .(DATE, period_id, reject_null, ztest, pvalue)],
+  april_may_daily_hf,
+  by = c("DATE", "period_id"),
+  all.x = TRUE
+)
+april_may_daily_features <- merge(
+  april_may_daily_features,
+  april_may_daily_tail,
+  by = c("DATE", "period_id"),
+  all.x = TRUE
+)
+april_may_daily_features <- april_may_daily_features[is.finite(rv) & is.finite(bpv)]
+
+jump_share_q75 <- quantile(april_may_daily_features$jump_share_rv, 0.75, na.rm = TRUE)
+
+april_may_mechanism_summary <- april_may_daily_features[
+  ,
+  .(
+    n_days = .N,
+    reject_days = sum(reject_null, na.rm = TRUE),
+    rejection_rate = mean(reject_null, na.rm = TRUE),
+    mean_abs_ztest = mean(abs(ztest), na.rm = TRUE),
+    median_pvalue = median(pvalue, na.rm = TRUE),
+    mean_rv = mean(rv, na.rm = TRUE),
+    mean_bpv_share_rv = mean(bpv_share_rv, na.rm = TRUE),
+    mean_jump_share_rv = mean(jump_share_rv, na.rm = TRUE),
+    high_jump_day_share = mean(jump_share_rv > jump_share_q75, na.rm = TRUE),
+    mean_jump_signal_scaled = mean(jump_signal_scaled, na.rm = TRUE),
+    p90_jump_signal_scaled = as.numeric(quantile(jump_signal_scaled, 0.90, na.rm = TRUE)),
+    mean_tpquar = mean(tpquar, na.rm = TRUE),
+    mean_max_abs_ret = mean(max_abs_ret, na.rm = TRUE),
+    mean_q99_abs_ret = mean(q99_abs_ret, na.rm = TRUE)
+  ),
+  by = period_id
+]
+setorder(april_may_mechanism_summary, -rejection_rate)
+
+april_may_mechanism_summary[]
+```
+
+```{r april-may-frequency-confidence-sensitivity}
+april_may_freq_conf <- copy(daily_details_all)
+april_may_freq_conf[, period_id := format(DATE, "%Y-%m")]
+april_may_freq_conf <- april_may_freq_conf[period_id %in% april_may_period_ids]
+
+april_may_freq_conf_summary <- april_may_freq_conf[
+  ,
+  .(
+    n_days = .N,
+    reject_days = sum(reject_null, na.rm = TRUE),
+    rejection_rate = mean(reject_null, na.rm = TRUE),
+    mean_abs_ztest = mean(abs(ztest), na.rm = TRUE)
+  ),
+  by = .(period_id, sample_minutes, confidence_level)
+]
+setorder(april_may_freq_conf_summary, confidence_level, sample_minutes, period_id)
+
+april_may_freq_conf_wide <- dcast(
+  april_may_freq_conf_summary,
+  sample_minutes + confidence_level ~ period_id,
+  value.var = "rejection_rate"
+)
+
+if (all(april_may_period_ids %in% names(april_may_freq_conf_wide))) {
+  april_may_freq_conf_wide[, april_minus_may := get(april_period_id) - get(may_period_id)]
+}
+
+april_may_freq_conf_summary[]
+april_may_freq_conf_wide[]
+```
+
+```{r april-may-bns-robustness}
+run_daily_bns_with_estimators <- function(sampled_pdata, confidence_level, iv_est, iq_est) {
+  alpha_quantile <- 1 - (1 - confidence_level) / 2
+  bns_obj <- BNSjumpTest(
+    rData = sampled_pdata,
+    IVestimator = iv_est,
+    IQestimator = iq_est,
+    type = "ratio",
+    max = TRUE,
+    makeReturns = TRUE,
+    alpha = alpha_quantile
+  )
+  extract_daily_bns_summary(
+    bns_obj,
+    confidence_level = confidence_level,
+    tz = "UTC"
+  )
+}
+
+bns_robust_variants <- list(
+  list(label = "BNS_BV_TP", iv = "BV", iq = "TP"),
+  list(label = "BNS_MedRV_TPQuar", iv = "rMedRVar", iq = "rTPQuar"),
+  list(label = "BNS_MinRV_TPQuar", iv = "rMinRVar", iq = "rTPQuar")
+)
+
+april_may_robust_results <- rbindlist(lapply(bns_robust_variants, function(v) {
+  daily <- run_daily_bns_with_estimators(
+    sampled_pdata = april_may_sampled_prices[, .(DT, PRICE)],
+    confidence_level = fixed_confidence_level,
+    iv_est = v$iv,
+    iq_est = v$iq
+  )
+  daily[, period_id := format(DATE, "%Y-%m")]
+  daily <- daily[period_id %in% april_may_period_ids]
+  daily[, variant := v$label]
+  daily
+}), fill = TRUE)
+
+april_may_robust_summary <- april_may_robust_results[
+  ,
+  .(
+    n_days = .N,
+    reject_days = sum(reject_null, na.rm = TRUE),
+    rejection_rate = mean(reject_null, na.rm = TRUE),
+    mean_abs_ztest = mean(abs(ztest), na.rm = TRUE),
+    median_pvalue = median(pvalue, na.rm = TRUE)
+  ),
+  by = .(variant, period_id)
+]
+setorder(april_may_robust_summary, variant, -rejection_rate)
+
+april_may_robust_summary[]
+```
+
+```{r april-may-diagnostics-plot, fig.width=12, fig.height=8}
+if (nrow(april_may_freq_conf_summary) == 0L || nrow(april_may_daily_features) == 0L) {
+  stop("No April-May diagnostics data to plot.")
+}
+
+plot_95 <- april_may_freq_conf_summary[abs(confidence_level - fixed_confidence_level) < 1e-10]
+plot_95_ids <- unique(plot_95$period_id)
+cols <- setNames(c("#D95F02", "#1B9E77", "#7570B3"), plot_95_ids)
+
+op <- par(no.readonly = TRUE)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+plot(
+  NA,
+  xlim = range(sample_freq_grid),
+  ylim = c(0, 1),
+  xlab = "Sampling Frequency (minutes)",
+  ylab = "Rejection rate",
+  main = paste0("Rejection by Sampling Frequency (", fixed_confidence_level * 100, "% CI)")
+)
+for (pid in plot_95_ids) {
+  sub <- plot_95[period_id == pid]
+  lines(sub$sample_minutes, sub$rejection_rate, type = "b", pch = 19, col = cols[[pid]])
+}
+legend("topright", legend = plot_95_ids, col = unname(cols[plot_95_ids]), pch = 19, lty = 1, bty = "n")
+
+boxplot(
+  jump_share_rv ~ period_id,
+  data = april_may_daily_features,
+  col = c("#FDD0A2", "#A1D99B"),
+  ylab = "Jump share of RV: max(RV - BPV, 0) / RV",
+  xlab = "Period",
+  main = "Daily Jump Share Distribution"
+)
+
+boxplot(
+  jump_signal_scaled ~ period_id,
+  data = april_may_daily_features,
+  col = c("#FEE391", "#9ECAE1"),
+  ylab = "(RV - BPV)+ / sqrt(TPQuar)",
+  xlab = "Period",
+  main = "Scaled Jump Signal"
+)
+
+boxplot(
+  max_abs_ret ~ period_id,
+  data = april_may_daily_features,
+  col = c("#FC9272", "#74C476"),
+  ylab = "Max |30m log return| per day",
+  xlab = "Period",
+  main = "Intraday Tail Size"
+)
+
+par(op)
+```
+
+```{r april-may-explanation-table}
+april_row <- april_may_mechanism_summary[period_id == april_period_id][1]
+may_row <- april_may_mechanism_summary[period_id == may_period_id][1]
+
+if (nrow(april_row) == 0L || nrow(may_row) == 0L) {
+  stop("Could not build April-May explanation table.")
+}
+
+april_may_explanation <- data.table(
+  comparison = paste0(april_period_id, " minus ", may_period_id),
+  rejection_rate_gap = april_row$rejection_rate - may_row$rejection_rate,
+  mean_abs_ztest_gap = april_row$mean_abs_ztest - may_row$mean_abs_ztest,
+  mean_jump_share_gap = april_row$mean_jump_share_rv - may_row$mean_jump_share_rv,
+  high_jump_day_share_gap = april_row$high_jump_day_share - may_row$high_jump_day_share,
+  mean_scaled_jump_signal_gap = april_row$mean_jump_signal_scaled - may_row$mean_jump_signal_scaled,
+  mean_max_abs_ret_gap = april_row$mean_max_abs_ret - may_row$mean_max_abs_ret,
+  mean_tpquar_gap = april_row$mean_tpquar - may_row$mean_tpquar
+)
+
+april_may_explanation[]
+```
+
+
